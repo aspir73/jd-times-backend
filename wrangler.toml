@@ -1,0 +1,24 @@
+name = "jd-times-backend"
+main = "src/index.js"
+compatibility_date = "2026-07-01"
+
+# 1. D1 데이터베이스 바인딩
+# 생성: wrangler d1 create jd-times-db
+[[d1_databases]]
+binding = "DB"
+database_name = "jd-times-db"
+database_id = "ec4cea0d-a15f-4b97-ac47-712633f5376d"
+
+# 2. KV 네임스페이스 바인딩 (RSS 15분 캐싱용)
+# 생성: wrangler kv namespace create RSS_CACHE
+[[kv_namespaces]]
+binding = "RSS_CACHE"
+id = "c28d7a5aba294a7c83bc25fa038e3602"
+
+# 3. (선택) rss2json.com API 키 - 직접 fetch가 구글에 차단될 때 자동 대체 경로로 사용
+# 설정: wrangler secret put RSS2JSON_API_KEY
+# vars에 넣지 말고 반드시 secret으로 등록할 것 (평문 노출 방지)
+
+# 4. Cron 트리거 - 3시간마다 전체 피드를 자동 수집해서 아카이브에 반영
+[triggers]
+crons = ["0 */3 * * *"]
