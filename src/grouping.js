@@ -110,6 +110,94 @@ function extractKeyword(titlesTokens) {
 }
 
 /**
+ * 하이브리드 클러스터링: 단어겹침(가중 Jaccard)과 임베딩(코사인) 두 신호를
+ * 하나의 Union-Find에서 함께 사용한다 — 둘 중 하나라도 임계값을 넘으면 묶는다.
+ *
+ * 왜 필요한가: 임베딩만 쓰면, AI 호출이 일부 실패하거나 임계값이 실제 데이터와
+ * 안 맞을 때 "LG전자, 주당 500원 중간배당" 같은 누가 봐도 같은 사건(단어가 거의 다 겹침)조차
+ * 놓칠 수 있다. 단어겹침은 이런 명백한 경우를 항상 잡아주는 안전망 역할을 하고,
+ * 임베딩은 단어가 안 겹치는 의역 사례까지 추가로 잡아준다.
+ *
+ * 대상이 '보안'/'LG전자' 두 피드로 한정되어 있어 배치가 작으므로(보통 수십 건 이내),
+ * O(n^2) 임베딩 비교도 비용 부담이 적다.
+ *
+ * @param {Array} articles - { title, link, pubDate, source, category, feedId, embedding }
+ * @param {object} options
+ * @param {number} options.lexicalThreshold - 가중 Jaccard 임계값 (기본 0.2)
+ * @param {number} options.embeddingThreshold - 코사인 유사도 임계값 (기본 0.82)
+ * @param {number} options.timeWindowHours - 이 시간 이상 차이나면 묶지 않음 (기본 48시간)
+ */
+export function groupArticlesHybrid(
+  articles,
+  { lexicalThreshold = 0.2, embeddingThreshold = 0.82, timeWindowHours = DEFAULT_TIME_WINDOW_HOURS } = {}
+) {
+  const withTokens = articles.map((a) => ({ ...a, _tokens: tokenize(a.title) }));
+  const tokenSets = withTokens.map((a) => new Set(a._tokens));
+  const n = withTokens.length;
+
+  if (n === 0) return [];
+
+  const docFreq = computeDocFreq(tokenSets);
+
+  const parent = Array.from({ length: n }, (_, i) => i);
+  function find(x) {
+    while (parent[x] !== x) {
+      parent[x] = parent[parent[x]];
+      x = parent[x];
+    }
+    return x;
+  }
+  function union(a, b) {
+    const ra = find(a);
+    const rb = find(b);
+    if (ra !== rb) parent[ra] = rb;
+  }
+
+  // 대상 배치가 작다는 전제(단일 피드 몇 개 분량) 하에 전수비교 — 두 신호 다 이 한 번의 순회에서 계산
+  for (let i = 0; i < n; i++) {
+    for (let j = i + 1; j < n; j++) {
+      if (hoursBetween(withTokens[i].pubDate, withTokens[j].pubDate) > timeWindowHours) continue;
+
+      const lexScore = weightedSimilarity(tokenSets[i], tokenSets[j], docFreq, n);
+      if (lexScore >= lexicalThreshold) {
+        union(i, j);
+        continue;
+      }
+
+      if (withTokens[i].embedding && withTokens[j].embedding) {
+        const embScore = cosineSimilarity(withTokens[i].embedding, withTokens[j].embedding);
+        if (embScore >= embeddingThreshold) union(i, j);
+      }
+    }
+  }
+
+  const groups = new Map();
+  for (let i = 0; i < n; i++) {
+    const root = find(i);
+    if (!groups.has(root)) groups.set(root, []);
+    groups.get(root).push(i);
+  }
+
+  return [...groups.values()].map((indices, idx) => {
+    const members = indices.map((i) => withTokens[i]);
+    const sortedMembers = [...members].sort(
+      (a, b) => new Date(b.pubDate).getTime() - new Date(a.pubDate).getTime()
+    );
+    const [primaryArticle, ...relatedArticles] = sortedMembers;
+    const keyword = extractKeyword(members.map((m) => m._tokens));
+
+    const strip = ({ _tokens, embedding, ...rest }) => rest;
+
+    return {
+      clusterId: `c${idx}_${primaryArticle.pubDate ?? ''}`.replace(/\W+/g, ''),
+      keyword: `[${keyword}]`,
+      primaryArticle: strip(primaryArticle),
+      relatedArticles: relatedArticles.map(strip),
+    };
+  });
+}
+
+/**
  * 임베딩(의미 벡터) 기반 클러스터링.
  * 단어가 하나도 안 겹쳐도 "의미가 비슷하면" 묶을 수 있다 (예: "해킹당했다" ↔ "보안이 뚫렸다").
  * article.embedding이 이미 채워져 있어야 한다 (호출부에서 computeEmbeddings로 미리 준비).

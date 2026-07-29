@@ -84,20 +84,20 @@ export async function bulkUpsertArticleStatus(db, articleIds, { isRead, isBookma
  * 주의: Today News의 영구 기록(picked_articles)은 절대 건드리지 않는다. 어제자 다이제스트는
  * 그대로 보존되고, 여기서는 오직 브라우즈 화면에 보이는 실시간 별/리본 아이콘 상태만 리셋한다.
  */
-export async function resetDailyMarkers(db, categories) {
-  if (!categories || categories.length === 0) return { updated: 0 };
+export async function resetDailyMarkers(db, feedTitles) {
+  if (!feedTitles || feedTitles.length === 0) return { updated: 0 };
 
-  const placeholders = categories.map(() => '?').join(',');
+  const placeholders = feedTitles.map(() => '?').join(',');
   const result = await db
     .prepare(
       `UPDATE user_article_status
        SET is_picked = 0, is_bookmarked = 0, updated_at = CURRENT_TIMESTAMP
        WHERE (is_picked = 1 OR is_bookmarked = 1)
          AND article_id IN (
-           SELECT article_id FROM archived_articles WHERE category IN (${placeholders})
+           SELECT article_id FROM archived_articles WHERE feed_title IN (${placeholders})
          )`
     )
-    .bind(...categories)
+    .bind(...feedTitles)
     .run();
 
   return { updated: result.meta.changes ?? 0 };
@@ -259,12 +259,28 @@ export async function removePick(db, articleId) {
 export async function getPicks(db, sinceIso = null) {
   const query = sinceIso
     ? db
-        .prepare('SELECT * FROM picked_articles WHERE picked_at >= ? ORDER BY picked_at DESC')
+        .prepare('SELECT * FROM picked_articles WHERE picked_at >= ? ORDER BY digest_date DESC, sort_order ASC, picked_at DESC')
         .bind(sinceIso)
-    : db.prepare('SELECT * FROM picked_articles ORDER BY picked_at DESC');
+    : db.prepare('SELECT * FROM picked_articles ORDER BY digest_date DESC, sort_order ASC, picked_at DESC');
 
   const { results } = await query.all();
   return results;
+}
+
+/**
+ * 스크랩 기사들의 순서(sort_order)를 한 번에 갱신.
+ * @param {Array<{articleId: string, sortOrder: number}>} orderedItems
+ */
+export async function updatePickOrder(db, orderedItems) {
+  if (!orderedItems || orderedItems.length === 0) return { updated: 0 };
+
+  const statements = orderedItems.map(({ articleId, sortOrder }) =>
+    db
+      .prepare('UPDATE picked_articles SET sort_order = ? WHERE article_id = ?')
+      .bind(sortOrder, articleId)
+  );
+  await db.batch(statements);
+  return { updated: orderedItems.length };
 }
 
 /**

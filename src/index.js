@@ -16,6 +16,7 @@ import {
   addPick,
   removePick,
   getPicks,
+  updatePickOrder,
   upsertArchivedArticles,
   getArchivedArticles,
   resetDailyMarkers,
@@ -65,8 +66,8 @@ function archivedRowToArticle(row) {
 
 const DEFAULT_WINDOW_HOURS = 24 * 3; // 기본 표시 기간: 3일
 
-/** '보안'/'LG전자' — 임베딩 클러스터링 대상 & 매일 9시 스크랩/북마크 리셋 대상 (동일 카테고리 재사용) */
-const PRIORITY_CATEGORIES = ['보안', 'LG전자'];
+/** '보안'/'LG전자' 피드(feed_title 기준) — 임베딩 클러스터링 대상 & 매일 9시 스크랩/북마크 리셋 대상 */
+const PRIORITY_FEED_TITLES = ['보안', 'LG전자'];
 
 /** ?hours= 파라미터 해석. 없으면 기본 7일, 'all'/'0'이면 필터 없음(전체 기간) */
 function resolveWindowHours(hoursParam) {
@@ -153,8 +154,8 @@ async function handleGetRss(request, env, ctx) {
 
   // 4) '보안'/'LG전자' 카테고리 기사만 임베딩 계산 대상으로 삼는다 — Workers AI 호출량을 최소화해서
   //    무료 사용량 안에서 계속 쓸 수 있도록 하기 위함. 나머지 카테고리는 AI 호출 없이 기존 단어겹침 방식 사용.
-  const priorityArticles = allArticles.filter((a) => PRIORITY_CATEGORIES.includes(a.category));
-  const otherArticles = allArticles.filter((a) => !PRIORITY_CATEGORIES.includes(a.category));
+  const priorityArticles = allArticles.filter((a) => PRIORITY_FEED_TITLES.includes(a.feedTitle));
+  const otherArticles = allArticles.filter((a) => !PRIORITY_FEED_TITLES.includes(a.feedTitle));
 
   const missingEmbeddingArticles = priorityArticles.filter((a) => !a.embedding);
   if (missingEmbeddingArticles.length > 0) {
@@ -395,6 +396,28 @@ async function handleRemovePick(env, articleId) {
 }
 
 /** GET /api/picks?period=today|week|month  (기본: 전체) */
+/**
+ * PATCH /api/picks/reorder
+ * body: { articleIds: string[] }  — 원하는 순서 그대로 (0번이 맨 앞)
+ */
+async function handleReorderPicks(request, env) {
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return json({ error: 'INVALID_JSON_BODY' }, 400);
+  }
+
+  const { articleIds } = body;
+  if (!Array.isArray(articleIds) || articleIds.length === 0) {
+    return json({ error: 'ARTICLE_IDS_REQUIRED' }, 400);
+  }
+
+  const orderedItems = articleIds.map((articleId, index) => ({ articleId, sortOrder: index }));
+  const result = await updatePickOrder(env.DB, orderedItems);
+  return json(result);
+}
+
 async function handleGetPicks(request, env) {
   const url = new URL(request.url);
   const period = url.searchParams.get('period');
@@ -462,6 +485,9 @@ export default {
         }
       }
 
+      if (pathname === '/api/picks/reorder' && request.method === 'PATCH') {
+        return await handleReorderPicks(request, env);
+      }
       if (pathname === '/api/picks' && request.method === 'GET') {
         return await handleGetPicks(request, env);
       }
@@ -490,7 +516,7 @@ export default {
   async scheduled(event, env, ctx) {
     if (event.cron === '0 0 * * *') {
       // 00:00 UTC = 오전 9시 KST — Today News 확정 시점, 지정 카테고리 스크랩/북마크 리셋
-      ctx.waitUntil(resetDailyMarkers(env.DB, PRIORITY_CATEGORIES));
+      ctx.waitUntil(resetDailyMarkers(env.DB, PRIORITY_FEED_TITLES));
     } else {
       ctx.waitUntil(runScheduledArchive(env));
     }
