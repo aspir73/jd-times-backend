@@ -1,8 +1,9 @@
 import { fetchArticlesForFeed } from './rss.js';
-import { groupArticles } from './grouping.js';
+import { groupArticles, groupArticlesByEmbedding } from './grouping.js';
 import { hashArticleId } from './utils/hash.js';
 import { formatKstDisplay } from './utils/kstDisplay.js';
 import { decodeGoogleNewsUrl } from './utils/googleNewsDecoder.js';
+import { computeEmbeddings } from './utils/embeddings.js';
 import {
   getAllFeeds,
   getFeedById,
@@ -17,6 +18,7 @@ import {
   getPicks,
   upsertArchivedArticles,
   getArchivedArticles,
+  resetDailyMarkers,
 } from './db.js';
 
 const CORS_HEADERS = {
@@ -39,6 +41,14 @@ function buildGoogleRssUrl(keyword) {
 
 /** 아카이브 DB row(snake_case)를 프론트에서 쓰는 article 포맷(camelCase)으로 변환 */
 function archivedRowToArticle(row) {
+  let embedding = null;
+  if (row.embedding) {
+    try {
+      embedding = JSON.parse(row.embedding);
+    } catch {
+      embedding = null;
+    }
+  }
   return {
     articleId: row.article_id,
     feedId: row.feed_id,
@@ -49,10 +59,14 @@ function archivedRowToArticle(row) {
     category: row.category || '일반',
     pubDate: row.pub_date || '',
     summary: row.summary || '',
+    embedding,
   };
 }
 
 const DEFAULT_WINDOW_HOURS = 24 * 3; // 기본 표시 기간: 3일
+
+/** '보안'/'LG전자' — 임베딩 클러스터링 대상 & 매일 9시 스크랩/북마크 리셋 대상 (동일 카테고리 재사용) */
+const PRIORITY_CATEGORIES = ['보안', 'LG전자'];
 
 /** ?hours= 파라미터 해석. 없으면 기본 7일, 'all'/'0'이면 필터 없음(전체 기간) */
 function resolveWindowHours(hoursParam) {
@@ -111,22 +125,24 @@ async function handleGetRss(request, env, ctx) {
     freshArticles.map(async (a) => ({ ...a, articleId: await hashArticleId(a.link) }))
   );
 
-  // 아카이브 반영은 응답을 기다리지 않고 백그라운드로 처리 (실패해도 응답에는 영향 없음)
-  if (freshArticles.length > 0) {
-    ctx.waitUntil(upsertArchivedArticles(env.DB, freshArticles).catch(() => {}));
-  }
-
-  // 2) 아카이브에서 같은 피드들의 과거 기사 조회 후 병합 (최신 실시간 데이터가 우선)
+  // 2) 아카이브에서 같은 피드들의 과거 기사 조회 후 병합 (최신 실시간 데이터가 우선, 임베딩은 있으면 이어받음)
   const archivedRows = await getArchivedArticles(
     env.DB,
     feeds.map((f) => f.id)
   );
-  const merged = new Map();
-  for (const row of archivedRows) merged.set(row.article_id, archivedRowToArticle(row));
+  const archivedMap = new Map(archivedRows.map((row) => [row.article_id, archivedRowToArticle(row)]));
+
+  // 실시간으로 새로 받아온 기사는 기존 아카이브에 임베딩이 캐시되어 있으면 그대로 이어받음
+  freshArticles = freshArticles.map((a) => ({
+    ...a,
+    embedding: archivedMap.get(a.articleId)?.embedding ?? null,
+  }));
+
+  const merged = new Map(archivedMap);
   for (const a of freshArticles) merged.set(a.articleId, a);
   let allArticles = [...merged.values()];
 
-  // 3) 기간 필터 (기본 7일, ?hours=all 이면 전체)
+  // 3) 기간 필터 (기본 3일, ?hours=all 이면 전체) — 화면에 표시할 대상만 추림
   if (windowHours !== null) {
     const cutoff = Date.now() - windowHours * 60 * 60 * 1000;
     allArticles = allArticles.filter((a) => {
@@ -135,9 +151,45 @@ async function handleGetRss(request, env, ctx) {
     });
   }
 
-  // 최신순 정렬 후 클러스터링
-  allArticles.sort((a, b) => new Date(b.pubDate).getTime() - new Date(a.pubDate).getTime());
-  const clusters = groupArticles(allArticles, 0.6);
+  // 4) '보안'/'LG전자' 카테고리 기사만 임베딩 계산 대상으로 삼는다 — Workers AI 호출량을 최소화해서
+  //    무료 사용량 안에서 계속 쓸 수 있도록 하기 위함. 나머지 카테고리는 AI 호출 없이 기존 단어겹침 방식 사용.
+  const priorityArticles = allArticles.filter((a) => PRIORITY_CATEGORIES.includes(a.category));
+  const otherArticles = allArticles.filter((a) => !PRIORITY_CATEGORIES.includes(a.category));
+
+  const missingEmbeddingArticles = priorityArticles.filter((a) => !a.embedding);
+  if (missingEmbeddingArticles.length > 0) {
+    const vectors = await computeEmbeddings(
+      env.AI,
+      missingEmbeddingArticles.map((a) => a.title)
+    );
+    missingEmbeddingArticles.forEach((a, i) => {
+      a.embedding = vectors[i] ?? null;
+    });
+  }
+
+  // 방금 계산한 임베딩을 freshArticles 쪽에도 반영 (같은 객체 참조가 아닐 수 있어 articleId로 매칭)
+  const embeddingById = new Map(priorityArticles.map((a) => [a.articleId, a.embedding]));
+  freshArticles = freshArticles.map((a) => ({ ...a, embedding: embeddingById.get(a.articleId) ?? a.embedding }));
+
+  // 아카이브 반영은 응답을 기다리지 않고 백그라운드로 처리 (실패해도 응답에는 영향 없음)
+  // 시간창 필터와 무관하게 이번에 새로 수집한 기사는 전부 저장 — "전체 기간" 검색의 완전성을 위해
+  if (freshArticles.length > 0) {
+    ctx.waitUntil(upsertArchivedArticles(env.DB, freshArticles).catch(() => {}));
+  }
+
+  // 클러스터링: 보안/LG전자는 임베딩 기반(의미 유사), 나머지는 단어겹침 기반(AI 호출 없음) — 결과를 합쳐서 반환
+  priorityArticles.sort((a, b) => new Date(b.pubDate).getTime() - new Date(a.pubDate).getTime());
+  otherArticles.sort((a, b) => new Date(b.pubDate).getTime() - new Date(a.pubDate).getTime());
+
+  const hasAnyEmbedding = priorityArticles.some((a) => a.embedding);
+  const priorityClusters = hasAnyEmbedding
+    ? groupArticlesByEmbedding(priorityArticles)
+    : groupArticles(priorityArticles); // 임베딩 전부 실패 시 안전하게 폴백
+  const otherClusters = groupArticles(otherArticles);
+
+  const clusters = [...priorityClusters, ...otherClusters].sort(
+    (a, b) => new Date(b.primaryArticle.pubDate).getTime() - new Date(a.primaryArticle.pubDate).getTime()
+  );
 
   // read/bookmark/pick 상태 매핑 (articleId는 이미 부여되어 있음)
   const allIds = clusters.flatMap((c) => [
@@ -357,6 +409,7 @@ async function handleGetPicks(request, env) {
   return json({ picks: picksWithDisplay });
 }
 
+/** 매일 오전 9시에 스크랩/북마크 표시를 초기화할 카테고리 목록 */
 /** Cron 트리거: 등록된 모든 피드를 강제 수집해서 아카이브에 반영 (사람이 앱을 안 열어도 실행됨) */
 async function runScheduledArchive(env) {
   const feeds = await getAllFeeds(env.DB);
@@ -435,6 +488,11 @@ export default {
 
   /** Cloudflare Cron Trigger 진입점 (wrangler.toml의 [triggers] crons 설정에 의해 호출됨) */
   async scheduled(event, env, ctx) {
-    ctx.waitUntil(runScheduledArchive(env));
+    if (event.cron === '0 0 * * *') {
+      // 00:00 UTC = 오전 9시 KST — Today News 확정 시점, 지정 카테고리 스크랩/북마크 리셋
+      ctx.waitUntil(resetDailyMarkers(env.DB, PRIORITY_CATEGORIES));
+    } else {
+      ctx.waitUntil(runScheduledArchive(env));
+    }
   },
 };

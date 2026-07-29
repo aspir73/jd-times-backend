@@ -80,6 +80,30 @@ export async function bulkUpsertArticleStatus(db, articleIds, { isRead, isBookma
 }
 
 /**
+ * 매일 오전 9시(Today News 확정 시점) — 지정된 카테고리의 스크랩/북마크 "표시 상태"를 초기화.
+ * 주의: Today News의 영구 기록(picked_articles)은 절대 건드리지 않는다. 어제자 다이제스트는
+ * 그대로 보존되고, 여기서는 오직 브라우즈 화면에 보이는 실시간 별/리본 아이콘 상태만 리셋한다.
+ */
+export async function resetDailyMarkers(db, categories) {
+  if (!categories || categories.length === 0) return { updated: 0 };
+
+  const placeholders = categories.map(() => '?').join(',');
+  const result = await db
+    .prepare(
+      `UPDATE user_article_status
+       SET is_picked = 0, is_bookmarked = 0, updated_at = CURRENT_TIMESTAMP
+       WHERE (is_picked = 1 OR is_bookmarked = 1)
+         AND article_id IN (
+           SELECT article_id FROM archived_articles WHERE category IN (${placeholders})
+         )`
+    )
+    .bind(...categories)
+    .run();
+
+  return { updated: result.meta.changes ?? 0 };
+}
+
+/**
  * 여러 article_id에 대한 read/bookmark 상태를 한 번에 조회.
  * D1(SQLite)은 한 쿼리당 바인딩 가능한 변수 개수에 제한(약 100개)이 있어
  * 청크 단위로 나눠 조회한 뒤 결과를 병합한다.
@@ -128,11 +152,12 @@ export async function upsertArchivedArticles(db, articles) {
         db
           .prepare(
             `INSERT INTO archived_articles
-               (article_id, feed_id, feed_title, title, link, source, category, pub_date, summary, first_seen_at, last_seen_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+               (article_id, feed_id, feed_title, title, link, source, category, pub_date, summary, embedding, first_seen_at, last_seen_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
              ON CONFLICT(article_id) DO UPDATE SET
                title = excluded.title,
                summary = excluded.summary,
+               embedding = COALESCE(excluded.embedding, archived_articles.embedding),
                last_seen_at = CURRENT_TIMESTAMP`
           )
           .bind(
@@ -144,7 +169,8 @@ export async function upsertArchivedArticles(db, articles) {
             a.source ?? '',
             a.category ?? '일반',
             a.pubDate ?? '',
-            a.summary ?? ''
+            a.summary ?? '',
+            a.embedding ? JSON.stringify(a.embedding) : null
           )
       );
     if (statements.length > 0) await db.batch(statements);

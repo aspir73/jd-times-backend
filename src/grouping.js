@@ -1,17 +1,10 @@
 /**
  * 유사도 기반 클러스터링 & 대표 키워드(1~2 워딩) 추출 엔진
  *
- * 정교한 형태소 분석기 없이 Workers 런타임에서 가볍게 동작하도록
- * 규칙 기반 조사 제거 + IDF 가중 Jaccard 유사도 방식을 사용.
- *
- * v2 개선점:
- * - IDF 가중치: 이번 수집 묶음 안에서 흔한 단어(피드 키워드 자체 등)는 가중치를 낮추고
- *   드문 단어는 가중치를 높여, 진짜 같은 사건인지 더 정확히 판별
- * - 그룹 내 전체 기사와 비교(최댓값 채택): 대표 기사 하나만 보지 않고 그룹 내 모든 기사 중
- *   가장 유사한 것을 기준으로 판단
- * - 시간창 제한: 기본 48시간 이상 차이 나면 단어가 비슷해도 별개 사건으로 취급
- *   (조회 기간이 7일~전체로 늘어나면서 반복되는 유형의 헤드라인이 오묶임되는 것 방지)
+ * v3: 기본 클러스터링은 Cloudflare Workers AI 임베딩(bge-m3) 기반 코사인 유사도로 전환.
+ * 단어 겹침(기존 groupArticles)은 임베딩 실패 시 폴백용으로 유지.
  */
+import { cosineSimilarity } from './utils/embeddings.js';
 
 // 제거 대상 한국어 조사/불용어 (어미 매칭용, 접미사로 사용)
 const PARTICLES = [
@@ -117,14 +110,95 @@ function extractKeyword(titlesTokens) {
 }
 
 /**
- * 기사 배열을 유사도 기준으로 클러스터링.
+ * 임베딩(의미 벡터) 기반 클러스터링.
+ * 단어가 하나도 안 겹쳐도 "의미가 비슷하면" 묶을 수 있다 (예: "해킹당했다" ↔ "보안이 뚫렸다").
+ * article.embedding이 이미 채워져 있어야 한다 (호출부에서 computeEmbeddings로 미리 준비).
+ *
+ * 비용 최적화: pubDate로 정렬한 뒤, 슬라이딩 윈도우로 timeWindowHours를 벗어나는 순간
+ * 더 볼 필요가 없으므로 즉시 break — O(n^2) 전수비교를 피한다.
+ *
+ * @param {Array} articles - { title, link, pubDate, source, category, feedId, embedding }
+ * @param {number} threshold - 코사인 유사도 임계값 (기본 0.86 — 배포 후 실측 기반 재조정 필요)
+ * @param {number} timeWindowHours
+ */
+export function groupArticlesByEmbedding(articles, threshold = 0.86, timeWindowHours = DEFAULT_TIME_WINDOW_HOURS) {
+  const withTokens = articles
+    .map((a) => ({ ...a, _tokens: tokenize(a.title) }))
+    .sort((a, b) => new Date(a.pubDate).getTime() - new Date(b.pubDate).getTime());
+  const n = withTokens.length;
+
+  const MAX_PAIRWISE_N = 600;
+  if (n > MAX_PAIRWISE_N) {
+    return withTokens.map((a, idx) => {
+      const strip = ({ _tokens, embedding, ...rest }) => rest;
+      return {
+        clusterId: `c${idx}_${a.pubDate ?? ''}`.replace(/\W+/g, ''),
+        keyword: `[${extractKeyword([a._tokens])}]`,
+        primaryArticle: strip(a),
+        relatedArticles: [],
+      };
+    });
+  }
+
+  const parent = Array.from({ length: n }, (_, i) => i);
+  function find(x) {
+    while (parent[x] !== x) {
+      parent[x] = parent[parent[x]];
+      x = parent[x];
+    }
+    return x;
+  }
+  function union(a, b) {
+    const ra = find(a);
+    const rb = find(b);
+    if (ra !== rb) parent[ra] = rb;
+  }
+
+  for (let i = 0; i < n; i++) {
+    if (!withTokens[i].embedding) continue; // 임베딩 실패한 기사는 비교 대상에서 제외(안전)
+    for (let j = i + 1; j < n; j++) {
+      // pubDate로 정렬되어 있으므로, 시간창을 벗어나는 순간 이후는 다 벗어남 → 더 볼 필요 없음
+      if (hoursBetween(withTokens[i].pubDate, withTokens[j].pubDate) > timeWindowHours) break;
+      if (!withTokens[j].embedding) continue;
+
+      const score = cosineSimilarity(withTokens[i].embedding, withTokens[j].embedding);
+      if (score >= threshold) union(i, j);
+    }
+  }
+
+  const groups = new Map();
+  for (let i = 0; i < n; i++) {
+    const root = find(i);
+    if (!groups.has(root)) groups.set(root, []);
+    groups.get(root).push(i);
+  }
+
+  return [...groups.values()].map((indices, idx) => {
+    const members = indices.map((i) => withTokens[i]);
+    const sortedMembers = [...members].sort(
+      (a, b) => new Date(b.pubDate).getTime() - new Date(a.pubDate).getTime()
+    );
+    const [primaryArticle, ...relatedArticles] = sortedMembers;
+    const keyword = extractKeyword(members.map((m) => m._tokens));
+
+    const strip = ({ _tokens, embedding, ...rest }) => rest;
+
+    return {
+      clusterId: `c${idx}_${primaryArticle.pubDate ?? ''}`.replace(/\W+/g, ''),
+      keyword: `[${keyword}]`,
+      primaryArticle: strip(primaryArticle),
+      relatedArticles: relatedArticles.map(strip),
+    };
+  });
+}
+
+/**
+ * 기사 배열을 유사도 기준으로 클러스터링 (단어 겹침 기반, 레거시/폴백용).
  * Union-Find(합집합-찾기) 기반: 모든 기사 쌍의 유사도를 비교해서 임계값 이상이면 연결하고,
  * 최종적으로 서로 연결된 기사들을 하나의 클러스터로 묶는다.
- * (순서대로 하나씩 넣는 방식과 달리 "A-B 유사, B-C 유사, but A-C는 안 유사"인
- *  사슬형 관계도 A/B/C를 전부 한 클러스터로 정확히 묶을 수 있다.)
  *
  * @param {Array} articles - { title, link, pubDate, source, category, feedId }
- * @param {number} threshold - IDF 가중 Jaccard 유사도 임계값 (기본 0.2 — 실제 사례 기반 재보정값)
+ * @param {number} threshold - IDF 가중 Jaccard 유사도 임계값 (기본 0.2)
  * @param {number} timeWindowHours - 이 시간(시간 단위) 이상 차이나면 묶지 않음 (기본 48시간)
  * @returns {Array} 클러스터 배열: { clusterId, keyword, primaryArticle, relatedArticles }
  */
