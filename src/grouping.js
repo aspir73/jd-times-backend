@@ -124,11 +124,11 @@ function extractKeyword(titlesTokens) {
  *  사슬형 관계도 A/B/C를 전부 한 클러스터로 정확히 묶을 수 있다.)
  *
  * @param {Array} articles - { title, link, pubDate, source, category, feedId }
- * @param {number} threshold - IDF 가중 Jaccard 유사도 임계값 (기본 0.35)
+ * @param {number} threshold - IDF 가중 Jaccard 유사도 임계값 (기본 0.2 — 실제 사례 기반 재보정값)
  * @param {number} timeWindowHours - 이 시간(시간 단위) 이상 차이나면 묶지 않음 (기본 48시간)
  * @returns {Array} 클러스터 배열: { clusterId, keyword, primaryArticle, relatedArticles }
  */
-export function groupArticles(articles, threshold = 0.35, timeWindowHours = DEFAULT_TIME_WINDOW_HOURS) {
+export function groupArticles(articles, threshold = 0.2, timeWindowHours = DEFAULT_TIME_WINDOW_HOURS) {
   const withTokens = articles.map((a) => ({
     ...a,
     _tokens: tokenize(a.title),
@@ -171,14 +171,14 @@ export function groupArticles(articles, threshold = 0.35, timeWindowHours = DEFA
 
   // --- 역색인으로 후보쌍 생성 (O(n^2) 전수비교 대신) ---
   // 토큰을 아예 공유하지 않는 두 기사의 가중 유사도는 반드시 0이므로, "겹치는 단어가 있는 쌍"만
-  // 비교 대상으로 삼아도 정확도 손실이 없다. 다만 거의 모든 기사에 등장하는 단어(피드 키워드 등)를
-  // 색인에 그대로 쓰면 그 단어 하나로 사실상 전체 쌍이 다시 후보가 되어버리므로,
-  // 전체 문서의 절반 이상에 등장하는 토큰은 애초에 색인에서 제외한다 (IDF도 어차피 0에 가까움).
+  // 비교 대상으로 삼아도 정확도 손실이 없다.
+  // (주의) 예전엔 "문서의 30% 이상에 등장하는 단어는 색인 제외"를 했었는데, 이게 오히려 버그였다:
+  // 특정 피드 하나만 조회하면 그 피드의 핵심 키워드(예: "안랩")가 사실상 모든 기사에 등장해서
+  // 제외 대상이 되어버렸고, 정작 기사들을 이어주는 연결고리 단어가 사라져 전혀 묶이지 않는
+  // 문제가 있었다. 지금은 버킷 크기 상한(MAX_BUCKET_SIZE) 하나로만 비용을 제어한다.
   const invertedIndex = new Map(); // token -> indices[]
-  const dfCeiling = Math.max(3, Math.floor(totalDocs * 0.3));
   for (let i = 0; i < n; i++) {
     for (const t of tokenSets[i]) {
-      if ((docFreq.get(t) || 0) > dfCeiling) continue;
       if (!invertedIndex.has(t)) invertedIndex.set(t, []);
       invertedIndex.get(t).push(i);
     }

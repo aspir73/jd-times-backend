@@ -2,6 +2,7 @@ import { fetchArticlesForFeed } from './rss.js';
 import { groupArticles } from './grouping.js';
 import { hashArticleId } from './utils/hash.js';
 import { formatKstDisplay } from './utils/kstDisplay.js';
+import { decodeGoogleNewsUrl } from './utils/googleNewsDecoder.js';
 import {
   getAllFeeds,
   getFeedById,
@@ -328,7 +329,10 @@ async function handleAddPick(request, env) {
     return json({ error: 'MISSING_REQUIRED_FIELDS', required: ['articleId', 'title', 'link'] }, 400);
   }
 
-  const result = await addPick(env.DB, body);
+  // 구글 뉴스 리다이렉트 링크면 원본 기사 URL로 디코딩 시도 (실패해도 조용히 원본 링크 유지)
+  const resolvedLink = await decodeGoogleNewsUrl(link);
+
+  const result = await addPick(env.DB, { ...body, link: resolvedLink });
   return json(result, 201);
 }
 
