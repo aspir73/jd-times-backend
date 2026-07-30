@@ -1,5 +1,5 @@
 import { fetchArticlesForFeed } from './rss.js';
-import { groupArticles, groupArticlesByEmbedding } from './grouping.js';
+import { groupArticles, groupArticlesHybrid } from './grouping.js';
 import { hashArticleId } from './utils/hash.js';
 import { formatKstDisplay } from './utils/kstDisplay.js';
 import { decodeGoogleNewsUrl } from './utils/googleNewsDecoder.js';
@@ -185,10 +185,7 @@ async function handleGetRss(request, env, ctx) {
   priorityArticles.sort((a, b) => new Date(b.pubDate).getTime() - new Date(a.pubDate).getTime());
   otherArticles.sort((a, b) => new Date(b.pubDate).getTime() - new Date(a.pubDate).getTime());
 
-  const hasAnyEmbedding = priorityArticles.some((a) => a.embedding);
-  const priorityClusters = hasAnyEmbedding
-    ? groupArticlesByEmbedding(priorityArticles)
-    : groupArticles(priorityArticles); // 임베딩 전부 실패 시 안전하게 폴백
+  const priorityClusters = groupArticlesHybrid(priorityArticles);
   const otherClusters = groupArticles(otherArticles);
 
   const clusters = [...priorityClusters, ...otherClusters].sort(
