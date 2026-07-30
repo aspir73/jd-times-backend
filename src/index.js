@@ -159,10 +159,13 @@ async function handleGetRss(request, env, ctx) {
 
   const missingEmbeddingArticles = priorityArticles.filter((a) => !a.embedding);
   if (missingEmbeddingArticles.length > 0) {
+    console.log('[embedding] 계산 대상:', missingEmbeddingArticles.length, '건');
     const vectors = await computeEmbeddings(
       env.AI,
       missingEmbeddingArticles.map((a) => a.title)
     );
+    const successCount = vectors.filter((v) => v).length;
+    console.log('[embedding] 성공:', successCount, '/', vectors.length);
     missingEmbeddingArticles.forEach((a, i) => {
       a.embedding = vectors[i] ?? null;
     });
