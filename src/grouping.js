@@ -194,24 +194,29 @@ function extractKeyword(titlesTokens) {
  * 놓칠 수 있다. 단어겹침은 이런 명백한 경우를 항상 잡아주는 안전망 역할을 하고,
  * 임베딩은 단어가 안 겹치는 의역 사례까지 추가로 잡아준다.
  *
- * 대상이 '보안'/'LG전자' 두 피드로 한정되어 있어 배치가 작으므로(보통 수십 건 이내),
- * O(n^2) 임베딩 비교도 비용 부담이 적다.
- *
  * @param {Array} articles - { title, link, pubDate, source, category, feedId, embedding }
  * @param {object} options
  * @param {number} options.lexicalThreshold - 가중 Jaccard 임계값 (기본 0.2)
- * @param {number} options.embeddingThreshold - 코사인 유사도 임계값 (기본 0.82)
+ * @param {number} options.embeddingThreshold - 코사인 유사도 임계값 (기본 0.65 — 실측 로그로 재조정 중)
  * @param {number} options.timeWindowHours - 이 시간 이상 차이나면 묶지 않음 (기본 48시간)
  */
 export function groupArticlesHybrid(
   articles,
-  { lexicalThreshold = 0.25, embeddingThreshold = 0.82, timeWindowHours = DEFAULT_TIME_WINDOW_HOURS } = {}
+  { lexicalThreshold = 0.25, embeddingThreshold = 0.65, timeWindowHours = DEFAULT_TIME_WINDOW_HOURS } = {}
 ) {
   const withTokens = articles.map((a) => ({ ...a, _tokens: tokenize(a.title) }));
   const tokenSets = withTokens.map((a) => new Set(a._tokens));
   const n = withTokens.length;
 
   if (n === 0) return [];
+
+  // 원래 "보안/LG전자 소량 배치" 전제로 O(n^2) 전수비교를 하도록 만들었는데, 실제로는 며칠치
+  // 아카이브가 쌓이면 수백 건까지 늘어날 수 있어 안전장치를 둔다 (초과 시 임베딩 전용 방식으로 대체).
+  const MAX_FULL_PAIRWISE_N = 500;
+  if (n > MAX_FULL_PAIRWISE_N) {
+    console.log(`[groupArticlesHybrid] 배치가 ${n}건이라 전수비교 대신 임베딩 전용 방식으로 대체`);
+    return groupArticlesByEmbedding(articles, embeddingThreshold, timeWindowHours);
+  }
 
   const parent = Array.from({ length: n }, (_, i) => i);
   function find(x) {
@@ -227,8 +232,11 @@ export function groupArticlesHybrid(
     if (ra !== rb) parent[ra] = rb;
   }
 
-  // 대상 배치가 작다는 전제(단일 피드 몇 개 분량) 하에 전수비교 — 두 신호 다 이 한 번의 순회에서 계산.
-  // 어휘 신호는 IDF 가중치를 쓰지 않는다: 배치가 좁은 주제(단일 피드)로 한정되어 있어서
+  // 실제 임베딩 유사도 분포를 보기 위한 진단 로그용 (기준값 재조정 근거 마련)
+  let maxEmbScoreSeen = 0;
+  let embMatchCount = 0;
+
+  // 어휘 신호는 IDF 가중치를 쓰지 않는다: 배치가 좁은 주제(단일/소수 피드)로 한정되어 있어서
   // "LG전자"·"영업이익"처럼 정확히 연결고리가 되는 핵심 단어가 오히려 흔하다는 이유로
   // 가중치가 깎여버리는 역효과가 있었다 (실측 사례로 확인됨). 그래서 순수 겹침 비율을 사용한다.
   for (let i = 0; i < n; i++) {
@@ -243,9 +251,19 @@ export function groupArticlesHybrid(
 
       if (withTokens[i].embedding && withTokens[j].embedding) {
         const embScore = cosineSimilarity(withTokens[i].embedding, withTokens[j].embedding);
-        if (embScore >= embeddingThreshold) union(i, j);
+        if (embScore > maxEmbScoreSeen) maxEmbScoreSeen = embScore;
+        if (embScore >= embeddingThreshold) {
+          union(i, j);
+          embMatchCount++;
+        }
       }
     }
+  }
+
+  if (n > 1) {
+    console.log(
+      `[groupArticlesHybrid] n=${n}, 임베딩으로 새로 묶인 쌍=${embMatchCount}, 관측된 최고 임베딩 점수=${maxEmbScoreSeen.toFixed(3)}`
+    );
   }
 
   const groups = new Map();
