@@ -204,17 +204,22 @@ export function groupArticlesHybrid(
   articles,
   { lexicalThreshold = 0.25, embeddingThreshold = 0.65, timeWindowHours = DEFAULT_TIME_WINDOW_HOURS } = {}
 ) {
-  const withTokens = articles.map((a) => ({ ...a, _tokens: tokenize(a.title) }));
+  // pubDate 기준 정렬 — 시간창을 벗어나는 순간 이후는 다 벗어나므로 바로 멈출 수 있어(break),
+  // 실제로는 "시간창 안에 있는 기사끼리"만 비교하게 되어 n이 커져도(수백~수천 건) 비용이 크게 준다.
+  // (전에는 964건 같은 큰 배치를 통째로 O(n^2) 전수비교하거나, 아예 임베딩 전용으로 건너뛰었는데
+  //  둘 다 별로였다 — 이제는 큰 배치에서도 단어겹침+임베딩 두 신호를 그대로 유지한다.)
+  const withTokens = articles
+    .map((a) => ({ ...a, _tokens: tokenize(a.title) }))
+    .sort((a, b) => new Date(a.pubDate).getTime() - new Date(b.pubDate).getTime());
   const tokenSets = withTokens.map((a) => new Set(a._tokens));
   const n = withTokens.length;
 
   if (n === 0) return [];
 
-  // 원래 "보안/LG전자 소량 배치" 전제로 O(n^2) 전수비교를 하도록 만들었는데, 실제로는 며칠치
-  // 아카이브가 쌓이면 수백 건까지 늘어날 수 있어 안전장치를 둔다 (초과 시 임베딩 전용 방식으로 대체).
-  const MAX_FULL_PAIRWISE_N = 500;
-  if (n > MAX_FULL_PAIRWISE_N) {
-    console.log(`[groupArticlesHybrid] 배치가 ${n}건이라 전수비교 대신 임베딩 전용 방식으로 대체`);
+  // 그래도 혹시 모를 극단적 상황(수만 건) 대비 최종 안전장치
+  const HARD_SAFETY_CAP = 5000;
+  if (n > HARD_SAFETY_CAP) {
+    console.log(`[groupArticlesHybrid] 배치가 ${n}건으로 너무 커서 임베딩 전용 방식으로 대체`);
     return groupArticlesByEmbedding(articles, embeddingThreshold, timeWindowHours);
   }
 
@@ -235,15 +240,32 @@ export function groupArticlesHybrid(
   // 실제 임베딩 유사도 분포를 보기 위한 진단 로그용 (기준값 재조정 근거 마련)
   let maxEmbScoreSeen = 0;
   let embMatchCount = 0;
+  let comparedPairs = 0;
 
-  // 어휘 신호는 IDF 가중치를 쓰지 않는다: 배치가 좁은 주제(단일/소수 피드)로 한정되어 있어서
-  // "LG전자"·"영업이익"처럼 정확히 연결고리가 되는 핵심 단어가 오히려 흔하다는 이유로
-  // 가중치가 깎여버리는 역효과가 있었다 (실측 사례로 확인됨). 그래서 순수 겹침 비율을 사용한다.
+  // 배치 크기에 따라 어휘 유사도 계산 방식을 자동으로 바꾼다.
+  // - 작은 배치(단일 회사 기사 몇 건 등): 그 회사명 같은 핵심 연결어가 배치의 100%에 등장해서
+  //   IDF로 계산하면 오히려 그 단어의 가중치가 0에 가깝게 깎여버려 안 묶이는 문제가 있었다(실측 확인).
+  //   → 순수 겹침 비율(raw Jaccard) 사용.
+  // - 큰 배치(하루~며칠치 전체 수집분, 수백~수천 건): 반대로 raw Jaccard를 쓰면 "보안"처럼 검색
+  //   키워드 자체가 다들 갖고 있는 흔한 단어 때문에 서로 무관한 기사들까지 다 묶여버리는 문제가
+  //   있었다(실측 확인, n=1000 테스트에서 전부 1개로 뭉침). → IDF 가중치로 흔한 단어를 눌러줘야 한다.
+  const SMALL_BATCH_THRESHOLD = 20;
+  const useIdf = n > SMALL_BATCH_THRESHOLD;
+  const docFreq = useIdf ? computeDocFreq(tokenSets) : null;
+
+  function lexicalSimilarity(i, j) {
+    return useIdf
+      ? weightedSimilarity(tokenSets[i], tokenSets[j], docFreq, n)
+      : rawJaccardSimilarity(tokenSets[i], tokenSets[j]);
+  }
+
   for (let i = 0; i < n; i++) {
     for (let j = i + 1; j < n; j++) {
-      if (hoursBetween(withTokens[i].pubDate, withTokens[j].pubDate) > timeWindowHours) continue;
+      // 정렬되어 있으므로, 시간창을 벗어나는 순간 이후 j는 전부 더 벗어남 → 더 볼 필요 없음
+      if (hoursBetween(withTokens[i].pubDate, withTokens[j].pubDate) > timeWindowHours) break;
+      comparedPairs++;
 
-      const lexScore = rawJaccardSimilarity(tokenSets[i], tokenSets[j]);
+      const lexScore = lexicalSimilarity(i, j);
       if (lexScore >= lexicalThreshold) {
         union(i, j);
         continue;
@@ -262,7 +284,7 @@ export function groupArticlesHybrid(
 
   if (n > 1) {
     console.log(
-      `[groupArticlesHybrid] n=${n}, 임베딩으로 새로 묶인 쌍=${embMatchCount}, 관측된 최고 임베딩 점수=${maxEmbScoreSeen.toFixed(3)}`
+      `[groupArticlesHybrid] n=${n}, 실제비교=${comparedPairs}쌍, 임베딩으로 새로 묶인 쌍=${embMatchCount}, 관측된 최고 임베딩 점수=${maxEmbScoreSeen.toFixed(3)}`
     );
   }
 
