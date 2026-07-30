@@ -42,11 +42,46 @@ export async function decodeGoogleNewsUrl(googleUrl) {
 const UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 
+/** 실제 RSS 수집(rss.js)에서 효과가 있었던 것과 동일한 브라우저 위장 헤더 */
+const BROWSER_HEADERS = {
+  'User-Agent': UA,
+  Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+  'Accept-Language': 'ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7',
+  'Accept-Encoding': 'gzip, deflate, br',
+  Referer: 'https://www.google.com/',
+  'sec-ch-ua': '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+  'sec-ch-ua-mobile': '?0',
+  'sec-ch-ua-platform': '"Windows"',
+  'Sec-Fetch-Dest': 'document',
+  'Sec-Fetch-Mode': 'navigate',
+  'Sec-Fetch-Site': 'same-origin',
+  'Upgrade-Insecure-Requests': '1',
+};
+
+const RETRYABLE_STATUS = new Set([429, 500, 502, 503, 504]);
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** 재시도 포함 fetch — 429/5xx면 최대 3번, 지수 백오프(0.5s, 1.5s)로 재시도 */
+async function fetchWithRetry(url, options, maxAttempts = 3) {
+  let lastRes = null;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const res = await fetch(url, options);
+    if (res.ok) return res;
+    lastRes = res;
+    if (!RETRYABLE_STATUS.has(res.status) || attempt === maxAttempts) return res;
+    console.log(`[decodeGoogleNewsUrl] status ${res.status}, ${attempt}번째 시도 실패 — 재시도`);
+    await sleep(500 * Math.pow(3, attempt - 1));
+  }
+  return lastRes;
+}
+
 /** 1차 시도: 구글 내부 batchexecute API */
 async function decodeViaBatchExecute(gnArtId) {
   // 1) 기사 페이지에서 서명(signature)/타임스탬프 추출
-  const paramsRes = await fetch(`https://news.google.com/rss/articles/${gnArtId}`, {
-    headers: { 'User-Agent': UA },
+  const paramsRes = await fetchWithRetry(`https://news.google.com/rss/articles/${gnArtId}`, {
+    headers: BROWSER_HEADERS,
   });
   if (!paramsRes.ok) {
     console.log('[decodeGoogleNewsUrl] 1단계 실패, status:', paramsRes.status);
@@ -70,12 +105,11 @@ async function decodeViaBatchExecute(gnArtId) {
   const payload = [[['Fbv4je', innerReq]]];
   const body = 'f.req=' + encodeURIComponent(JSON.stringify(payload));
 
-  const execRes = await fetch('https://news.google.com/_/DotsSplashUi/data/batchexecute', {
+  const execRes = await fetchWithRetry('https://news.google.com/_/DotsSplashUi/data/batchexecute', {
     method: 'POST',
     headers: {
+      ...BROWSER_HEADERS,
       'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8',
-      Referer: 'https://news.google.com/',
-      'User-Agent': UA,
     },
     body,
   });
@@ -98,7 +132,7 @@ async function decodeViaBatchExecute(gnArtId) {
 async function decodeViaHttpRedirect(googleUrl) {
   try {
     const res = await fetch(googleUrl, {
-      headers: { 'User-Agent': UA },
+      headers: BROWSER_HEADERS,
       redirect: 'follow',
     });
     // 리다이렉트를 안 타고 그대로 news.google.com에 남아있으면 실패로 간주
