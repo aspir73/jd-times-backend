@@ -24,6 +24,59 @@ const STOPWORDS = new Set([
 ]);
 
 /**
+ * 대표기사 선정용 언론사 신뢰도 가중치.
+ * 주요 통신사/일간지/전문지에 가점을 주고, 목록에 없는 언론사는 기본값(1)을 사용한다.
+ * (참고: 본문 길이는 저희가 원문을 긁어오지 않아서 점수에 못 넣고, 대신 RSS 요약문 유무/길이로 대체한다.)
+ */
+const SOURCE_CREDIBILITY = {
+  연합뉴스: 2.0,
+  '연합뉴스TV': 1.8,
+  KBS: 1.8,
+  MBC: 1.8,
+  SBS: 1.8,
+  YTN: 1.6,
+  조선일보: 1.6,
+  중앙일보: 1.6,
+  동아일보: 1.6,
+  한국경제: 1.6,
+  매일경제: 1.6,
+  전자신문: 1.5,
+  보안뉴스: 1.5,
+  한겨레: 1.4,
+  경향신문: 1.4,
+  머니투데이: 1.3,
+  이데일리: 1.3,
+  뉴시스: 1.3,
+  뉴스1: 1.3,
+};
+
+/** 대표기사 선정 점수: 언론사 신뢰도 + 최신성 + 요약문 존재/길이 */
+function scoreArticleForPrimary(article) {
+  const credibility = SOURCE_CREDIBILITY[article.source] ?? 1;
+
+  const ageMs = Date.now() - new Date(article.pubDate).getTime();
+  const ageHours = Number.isFinite(ageMs) ? Math.max(0, ageMs / (1000 * 60 * 60)) : 999;
+  const recencyScore = Math.max(0, 1 - ageHours / 48); // 48시간 지나면 0에 수렴
+
+  const summaryLen = (article.summary || '').length;
+  const summaryScore = Math.min(summaryLen / 200, 1); // 200자 이상이면 만점
+
+  return credibility * 2 + recencyScore * 1.5 + summaryScore * 1;
+}
+
+/** 클러스터 멤버 중 대표기사를 점수 기준으로 선택, 나머지는 관련기사로 (최신순 정렬) */
+function selectPrimaryArticle(members) {
+  const sortedByScore = [...members].sort(
+    (a, b) => scoreArticleForPrimary(b) - scoreArticleForPrimary(a)
+  );
+  const [primaryArticle] = sortedByScore;
+  const relatedArticles = members
+    .filter((m) => m !== primaryArticle)
+    .sort((a, b) => new Date(b.pubDate).getTime() - new Date(a.pubDate).getTime());
+  return [primaryArticle, ...relatedArticles];
+}
+
+/**
  * 언론사마다 다르게 쓰는 축약/동의 표현을 같은 단어로 정규화.
  * (예: "영업이익"을 "영업익"으로 줄여 쓰는 언론사가 많아, 그대로 두면 완전히 다른 단어로 처리되어
  *  명백히 같은 실적 발표 기사인데도 안 묶이는 문제가 있었다.)
@@ -204,10 +257,7 @@ export function groupArticlesHybrid(
 
   return [...groups.values()].map((indices, idx) => {
     const members = indices.map((i) => withTokens[i]);
-    const sortedMembers = [...members].sort(
-      (a, b) => new Date(b.pubDate).getTime() - new Date(a.pubDate).getTime()
-    );
-    const [primaryArticle, ...relatedArticles] = sortedMembers;
+    const [primaryArticle, ...relatedArticles] = selectPrimaryArticle(members);
     const keyword = extractKeyword(members.map((m) => m._tokens));
 
     const strip = ({ _tokens, embedding, ...rest }) => rest;
@@ -287,10 +337,7 @@ export function groupArticlesByEmbedding(articles, threshold = 0.86, timeWindowH
 
   return [...groups.values()].map((indices, idx) => {
     const members = indices.map((i) => withTokens[i]);
-    const sortedMembers = [...members].sort(
-      (a, b) => new Date(b.pubDate).getTime() - new Date(a.pubDate).getTime()
-    );
-    const [primaryArticle, ...relatedArticles] = sortedMembers;
+    const [primaryArticle, ...relatedArticles] = selectPrimaryArticle(members);
     const keyword = extractKeyword(members.map((m) => m._tokens));
 
     const strip = ({ _tokens, embedding, ...rest }) => rest;
@@ -400,10 +447,7 @@ export function groupArticles(articles, threshold = 0.2, timeWindowHours = DEFAU
 
   return [...groups.values()].map((indices, idx) => {
     const members = indices.map((i) => withTokens[i]);
-    const sortedMembers = [...members].sort(
-      (a, b) => new Date(b.pubDate).getTime() - new Date(a.pubDate).getTime()
-    );
-    const [primaryArticle, ...relatedArticles] = sortedMembers;
+    const [primaryArticle, ...relatedArticles] = selectPrimaryArticle(members);
     const keyword = extractKeyword(members.map((m) => m._tokens));
 
     const strip = ({ _tokens, ...rest }) => rest;
