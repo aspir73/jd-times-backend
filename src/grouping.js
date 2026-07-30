@@ -23,6 +23,72 @@ const STOPWORDS = new Set([
   '기자', '뉴스', '이번', '지난', '올해', '내년',
 ]);
 
+/**
+ * 대표기사 선정용 언론사 신뢰도 가중치.
+ * 주요 통신사/일간지/전문지에 가점을 주고, 목록에 없는 언론사는 기본값(1)을 사용한다.
+ * (참고: 본문 길이는 저희가 원문을 긁어오지 않아서 점수에 못 넣고, 대신 RSS 요약문 유무/길이로 대체한다.)
+ */
+const SOURCE_CREDIBILITY = {
+  연합뉴스: 2.0,
+  '연합뉴스TV': 1.8,
+  KBS: 1.8,
+  MBC: 1.8,
+  SBS: 1.8,
+  YTN: 1.6,
+  조선일보: 1.6,
+  중앙일보: 1.6,
+  동아일보: 1.6,
+  한국경제: 1.6,
+  매일경제: 1.6,
+  전자신문: 1.5,
+  보안뉴스: 1.5,
+  한겨레: 1.4,
+  경향신문: 1.4,
+  머니투데이: 1.3,
+  이데일리: 1.3,
+  뉴시스: 1.3,
+  뉴스1: 1.3,
+};
+
+/** 대표기사 선정 점수: 언론사 신뢰도 + 최신성 + 요약문 존재/길이 */
+function scoreArticleForPrimary(article) {
+  const credibility = SOURCE_CREDIBILITY[article.source] ?? 1;
+
+  const ageMs = Date.now() - new Date(article.pubDate).getTime();
+  const ageHours = Number.isFinite(ageMs) ? Math.max(0, ageMs / (1000 * 60 * 60)) : 999;
+  const recencyScore = Math.max(0, 1 - ageHours / 48); // 48시간 지나면 0에 수렴
+
+  const summaryLen = (article.summary || '').length;
+  const summaryScore = Math.min(summaryLen / 200, 1); // 200자 이상이면 만점
+
+  return credibility * 2 + recencyScore * 1.5 + summaryScore * 1;
+}
+
+/** 클러스터 멤버 중 대표기사를 점수 기준으로 선택, 나머지는 관련기사로 (최신순 정렬) */
+function selectPrimaryArticle(members) {
+  const sortedByScore = [...members].sort(
+    (a, b) => scoreArticleForPrimary(b) - scoreArticleForPrimary(a)
+  );
+  const [primaryArticle] = sortedByScore;
+  const relatedArticles = members
+    .filter((m) => m !== primaryArticle)
+    .sort((a, b) => new Date(b.pubDate).getTime() - new Date(a.pubDate).getTime());
+  return [primaryArticle, ...relatedArticles];
+}
+
+/**
+ * 언론사마다 다르게 쓰는 축약/동의 표현을 같은 단어로 정규화.
+ * (예: "영업이익"을 "영업익"으로 줄여 쓰는 언론사가 많아, 그대로 두면 완전히 다른 단어로 처리되어
+ *  명백히 같은 실적 발표 기사인데도 안 묶이는 문제가 있었다.)
+ */
+const SYNONYM_MAP = {
+  영업익: '영업이익',
+  순익: '순이익',
+  당기순이익: '순이익',
+  매출액: '매출',
+  작년: '전년',
+};
+
 const DEFAULT_TIME_WINDOW_HOURS = 48;
 
 /** 제목에서 조사를 제거하고 명사 후보 토큰을 추출 */
@@ -45,7 +111,7 @@ function tokenize(title) {
     }
 
     if (word.length >= 2 && !STOPWORDS.has(word)) {
-      tokens.push(word);
+      tokens.push(SYNONYM_MAP[word] || word);
     }
   }
   return tokens;
@@ -85,6 +151,16 @@ function weightedSimilarity(setA, setB, docFreq, totalDocs) {
     if (!seen.has(t)) unionWeight += idfWeight(t, docFreq, totalDocs);
   }
   return unionWeight === 0 ? 0 : interWeight / unionWeight;
+}
+
+function rawJaccardSimilarity(setA, setB) {
+  if (setA.size === 0 || setB.size === 0) return 0;
+  let intersection = 0;
+  for (const t of setA) {
+    if (setB.has(t)) intersection += 1;
+  }
+  const union = setA.size + setB.size - intersection;
+  return union === 0 ? 0 : intersection / union;
 }
 
 function hoursBetween(dateStrA, dateStrB) {
@@ -129,15 +205,13 @@ function extractKeyword(titlesTokens) {
  */
 export function groupArticlesHybrid(
   articles,
-  { lexicalThreshold = 0.2, embeddingThreshold = 0.82, timeWindowHours = DEFAULT_TIME_WINDOW_HOURS } = {}
+  { lexicalThreshold = 0.25, embeddingThreshold = 0.82, timeWindowHours = DEFAULT_TIME_WINDOW_HOURS } = {}
 ) {
   const withTokens = articles.map((a) => ({ ...a, _tokens: tokenize(a.title) }));
   const tokenSets = withTokens.map((a) => new Set(a._tokens));
   const n = withTokens.length;
 
   if (n === 0) return [];
-
-  const docFreq = computeDocFreq(tokenSets);
 
   const parent = Array.from({ length: n }, (_, i) => i);
   function find(x) {
@@ -153,12 +227,15 @@ export function groupArticlesHybrid(
     if (ra !== rb) parent[ra] = rb;
   }
 
-  // 대상 배치가 작다는 전제(단일 피드 몇 개 분량) 하에 전수비교 — 두 신호 다 이 한 번의 순회에서 계산
+  // 대상 배치가 작다는 전제(단일 피드 몇 개 분량) 하에 전수비교 — 두 신호 다 이 한 번의 순회에서 계산.
+  // 어휘 신호는 IDF 가중치를 쓰지 않는다: 배치가 좁은 주제(단일 피드)로 한정되어 있어서
+  // "LG전자"·"영업이익"처럼 정확히 연결고리가 되는 핵심 단어가 오히려 흔하다는 이유로
+  // 가중치가 깎여버리는 역효과가 있었다 (실측 사례로 확인됨). 그래서 순수 겹침 비율을 사용한다.
   for (let i = 0; i < n; i++) {
     for (let j = i + 1; j < n; j++) {
       if (hoursBetween(withTokens[i].pubDate, withTokens[j].pubDate) > timeWindowHours) continue;
 
-      const lexScore = weightedSimilarity(tokenSets[i], tokenSets[j], docFreq, n);
+      const lexScore = rawJaccardSimilarity(tokenSets[i], tokenSets[j]);
       if (lexScore >= lexicalThreshold) {
         union(i, j);
         continue;
@@ -180,10 +257,7 @@ export function groupArticlesHybrid(
 
   return [...groups.values()].map((indices, idx) => {
     const members = indices.map((i) => withTokens[i]);
-    const sortedMembers = [...members].sort(
-      (a, b) => new Date(b.pubDate).getTime() - new Date(a.pubDate).getTime()
-    );
-    const [primaryArticle, ...relatedArticles] = sortedMembers;
+    const [primaryArticle, ...relatedArticles] = selectPrimaryArticle(members);
     const keyword = extractKeyword(members.map((m) => m._tokens));
 
     const strip = ({ _tokens, embedding, ...rest }) => rest;
@@ -263,10 +337,7 @@ export function groupArticlesByEmbedding(articles, threshold = 0.86, timeWindowH
 
   return [...groups.values()].map((indices, idx) => {
     const members = indices.map((i) => withTokens[i]);
-    const sortedMembers = [...members].sort(
-      (a, b) => new Date(b.pubDate).getTime() - new Date(a.pubDate).getTime()
-    );
-    const [primaryArticle, ...relatedArticles] = sortedMembers;
+    const [primaryArticle, ...relatedArticles] = selectPrimaryArticle(members);
     const keyword = extractKeyword(members.map((m) => m._tokens));
 
     const strip = ({ _tokens, embedding, ...rest }) => rest;
@@ -376,10 +447,7 @@ export function groupArticles(articles, threshold = 0.2, timeWindowHours = DEFAU
 
   return [...groups.values()].map((indices, idx) => {
     const members = indices.map((i) => withTokens[i]);
-    const sortedMembers = [...members].sort(
-      (a, b) => new Date(b.pubDate).getTime() - new Date(a.pubDate).getTime()
-    );
-    const [primaryArticle, ...relatedArticles] = sortedMembers;
+    const [primaryArticle, ...relatedArticles] = selectPrimaryArticle(members);
     const keyword = extractKeyword(members.map((m) => m._tokens));
 
     const strip = ({ _tokens, ...rest }) => rest;
