@@ -535,9 +535,13 @@ export default {
   /** Cloudflare Cron Trigger 진입점 (wrangler.toml의 [triggers] crons 설정에 의해 호출됨) */
   async scheduled(event, env, ctx) {
     if (event.cron === '0 0 * * *') {
-      // 00:00 UTC = 오전 9시 KST — Today News 확정 시점, 지정 카테고리 스크랩/북마크 리셋
-      ctx.waitUntil(resetDailyMarkers(env.DB, PRIORITY_FEED_TITLES));
+      // 00:00 UTC = 오전 9시 KST — Today News 확정 시점.
+      // 마감 직전 마지막 수집을 한 번 더 한 뒤(막판에 나온 기사도 놓치지 않도록), 지정 카테고리 리셋.
+      ctx.waitUntil(
+        runScheduledArchive(env).then(() => resetDailyMarkers(env.DB, PRIORITY_FEED_TITLES))
+      );
     } else {
+      // '0 */3 * * *'(3시간마다, 종일) 또는 '*/30 21-23 * * *'(오전 6~9시 KST, 30분마다) 둘 다 수집만.
       ctx.waitUntil(runScheduledArchive(env));
     }
   },
