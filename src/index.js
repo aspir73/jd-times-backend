@@ -157,9 +157,12 @@ async function handleGetRss(request, env, ctx) {
   const priorityArticles = allArticles.filter((a) => PRIORITY_FEED_TITLES.includes(a.feedTitle));
   const otherArticles = allArticles.filter((a) => !PRIORITY_FEED_TITLES.includes(a.feedTitle));
 
-  const missingEmbeddingArticles = priorityArticles.filter((a) => !a.embedding);
+  // 실시간 요청(사용자가 새로고침 누르는 순간) 안에서는 소량만 즉석 계산해서 응답이 오래 안 걸리게 한다.
+  // 나머지(대부분)는 3시간마다 도는 Cron이 백그라운드에서 미리 채워두고, 다음 요청부터는 캐시를 그대로 쓴다.
+  const MAX_SYNC_EMBEDDINGS = 20;
+  const missingEmbeddingArticles = priorityArticles.filter((a) => !a.embedding).slice(0, MAX_SYNC_EMBEDDINGS);
   if (missingEmbeddingArticles.length > 0) {
-    console.log('[embedding] 계산 대상:', missingEmbeddingArticles.length, '건');
+    console.log('[embedding] 실시간 계산 대상(최대 20건 제한):', missingEmbeddingArticles.length, '건');
     const vectors = await computeEmbeddings(
       env.AI,
       missingEmbeddingArticles.map((a) => a.title)
@@ -450,6 +453,23 @@ async function runScheduledArchive(env) {
   const withIds = await Promise.all(
     all.map(async (a) => ({ ...a, articleId: await hashArticleId(a.link) }))
   );
+
+  // '보안'/'LG전자' 피드 기사는 임베딩까지 미리 계산해서 저장해둔다.
+  // (Cron은 사용자 요청을 기다리게 하지 않으니, 실시간 요청에서 못 다 채운 나머지를 여기서 채운다.
+  //  실시간 응답이 임베딩 계산 때문에 느려지거나 타임아웃 나는 걸 막기 위한 구조.)
+  const priorityItems = withIds.filter((a) => PRIORITY_FEED_TITLES.includes(a.feedTitle));
+  const EMBEDDING_BATCH_SIZE = 50;
+  for (let i = 0; i < priorityItems.length; i += EMBEDDING_BATCH_SIZE) {
+    const batch = priorityItems.slice(i, i + EMBEDDING_BATCH_SIZE);
+    const vectors = await computeEmbeddings(
+      env.AI,
+      batch.map((a) => a.title)
+    );
+    batch.forEach((a, idx) => {
+      a.embedding = vectors[idx] ?? null;
+    });
+  }
+  console.log('[cron] 임베딩 사전 계산:', priorityItems.filter((a) => a.embedding).length, '/', priorityItems.length);
 
   await upsertArchivedArticles(env.DB, withIds);
 }
