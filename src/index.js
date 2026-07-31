@@ -431,7 +431,13 @@ async function handleGetPicks(request, env) {
   }
 
   const picks = await getPicks(env.DB, sinceIso);
-  const picksWithDisplay = picks.map((p) => ({ ...p, pub_date_display: formatKstDisplay(p.pub_date) }));
+  const picksWithDisplay = await Promise.all(
+    picks.map(async (p) => ({
+      ...p,
+      link: await decodeGoogleNewsUrl(p.link),
+      pub_date_display: formatKstDisplay(p.pub_date),
+    }))
+  );
   return json({ picks: picksWithDisplay });
 }
 

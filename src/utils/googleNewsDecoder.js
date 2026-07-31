@@ -16,18 +16,21 @@
  */
 export async function decodeGoogleNewsUrl(googleUrl) {
   try {
-    const url = new URL(googleUrl);
-    if (url.hostname !== 'news.google.com') return googleUrl;
+    if (!googleUrl) return googleUrl;
 
-    const pathParts = url.pathname.split('/').filter(Boolean);
-    const gnArtId = pathParts[pathParts.length - 1];
-    if (!gnArtId || gnArtId.length < 20) {
+    const url = new URL(googleUrl);
+    if (!isGoogleNewsHost(url.hostname)) return googleUrl;
+
+    const gnArtId = extractGoogleNewsArticleId(url);
+    if (!gnArtId) {
       console.log('[decodeGoogleNewsUrl] gn_art_id 추출 실패:', url.pathname);
-      return googleUrl;
     }
 
-    const viaBatchExecute = await decodeViaBatchExecute(gnArtId);
+    const viaBatchExecute = gnArtId ? await decodeViaBatchExecute(gnArtId) : null;
     if (viaBatchExecute) return normalizeUrl(viaBatchExecute);
+
+    const viaHtml = await decodeViaHtmlFallback(googleUrl, gnArtId);
+    if (viaHtml) return normalizeUrl(viaHtml);
 
     const viaRedirect = await decodeViaHttpRedirect(googleUrl);
     if (viaRedirect) return normalizeUrl(viaRedirect);
@@ -37,6 +40,23 @@ export async function decodeGoogleNewsUrl(googleUrl) {
     console.log('[decodeGoogleNewsUrl] 예외 발생:', String(err));
     return googleUrl;
   }
+}
+
+function isGoogleNewsHost(hostname) {
+  return hostname === 'news.google.com' || hostname === 'news.google.co.kr' || hostname.endsWith('.news.google.com');
+}
+
+function extractGoogleNewsArticleId(url) {
+  const pathParts = url.pathname.split('/').filter(Boolean);
+
+  for (let i = 0; i < pathParts.length - 1; i += 1) {
+    if (pathParts[i] === 'articles' && pathParts[i + 1]) {
+      return pathParts[i + 1];
+    }
+  }
+
+  const fallback = pathParts[pathParts.length - 1];
+  return fallback && !['rss', 'articles'].includes(fallback) ? fallback : null;
 }
 
 const UA =
@@ -129,14 +149,47 @@ async function decodeViaBatchExecute(gnArtId) {
 }
 
 /** 2차 폴백: 그냥 HTTP 리다이렉트를 따라가서 최종 도착지를 본다 (가끔 통함) */
+async function decodeViaHtmlFallback(googleUrl, gnArtId) {
+  const targetUrl = gnArtId ? `https://news.google.com/rss/articles/${gnArtId}` : googleUrl;
+
+  try {
+    const res = await fetchWithRetry(targetUrl, {
+      headers: BROWSER_HEADERS,
+    });
+    if (!res.ok) return null;
+
+    const html = await res.text();
+    const urls = extractCandidateUrlsFromHtml(html);
+    for (const candidate of urls) {
+      if (candidate.startsWith('http') && !isGoogleNewsHost(new URL(candidate).hostname)) {
+        console.log('[decodeGoogleNewsUrl] HTML fallback 성공:', candidate);
+        return candidate;
+      }
+    }
+    return null;
+  } catch (err) {
+    console.log('[decodeGoogleNewsUrl] HTML fallback 실패:', String(err));
+    return null;
+  }
+}
+
 async function decodeViaHttpRedirect(googleUrl) {
   try {
     const res = await fetch(googleUrl, {
       headers: BROWSER_HEADERS,
-      redirect: 'follow',
+      redirect: 'manual',
     });
-    // 리다이렉트를 안 타고 그대로 news.google.com에 남아있으면 실패로 간주
-    if (res.url && !res.url.includes('news.google.com')) {
+
+    const location = res.headers.get('location');
+    if (location) {
+      const resolved = new URL(location, googleUrl).toString();
+      if (!isGoogleNewsHost(new URL(resolved).hostname)) {
+        console.log('[decodeGoogleNewsUrl] HTTP 리다이렉트 폴백 성공:', resolved);
+        return resolved;
+      }
+    }
+
+    if (res.url && !isGoogleNewsHost(new URL(res.url).hostname)) {
       console.log('[decodeGoogleNewsUrl] HTTP 리다이렉트 폴백 성공:', res.url);
       return res.url;
     }
@@ -145,6 +198,40 @@ async function decodeViaHttpRedirect(googleUrl) {
     console.log('[decodeGoogleNewsUrl] 리다이렉트 폴백 실패:', String(err));
     return null;
   }
+}
+
+function extractCandidateUrlsFromHtml(html) {
+  const candidates = [];
+  const seen = new Set();
+  const patterns = [
+    /<meta[^>]+property=["']og:url["'][^>]+content=["']([^"']+)["']/gi,
+    /<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:url["']/gi,
+    /(?:data-url|href)=["']([^"']+)["']/gi,
+  ];
+
+  for (const pattern of patterns) {
+    for (const match of html.matchAll(pattern)) {
+      const rawValue = match[1];
+      if (!rawValue) continue;
+      const decoded = decodeHtmlEntities(rawValue).trim();
+      if (!decoded.startsWith('http')) continue;
+      if (!seen.has(decoded)) {
+        seen.add(decoded);
+        candidates.push(decoded);
+      }
+    }
+  }
+
+  return candidates;
+}
+
+function decodeHtmlEntities(value) {
+  return value
+    .replace(/&amp;/g, '&')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>');
 }
 
 /** 추적용 쿼리 파라미터(utm_* 등)를 제거해서 URL을 정규화 */
