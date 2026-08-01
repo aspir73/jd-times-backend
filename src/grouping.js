@@ -91,6 +91,13 @@ const SYNONYM_MAP = {
 
 const DEFAULT_TIME_WINDOW_HOURS = 48;
 
+/**
+ * groupArticlesHybrid가 임베딩 코사인 비교를 실제로 수행하는 상한 기사 수.
+ * index.js도 이 값을 보고, 어차피 이 상한을 넘겨 단어겹침 전용으로 처리될 배치라면
+ * 아카이브에서 읽어온 임베딩 JSON을 애초에 파싱하지 않고 건너뛴다(파싱 자체가 CPU 낭비이므로).
+ */
+export const HYBRID_EMBEDDING_MAX_N = 300;
+
 /** 제목에서 조사를 제거하고 명사 후보 토큰을 추출 */
 function tokenize(title) {
   const raw = title
@@ -216,11 +223,15 @@ export function groupArticlesHybrid(
 
   if (n === 0) return [];
 
-  // 그래도 혹시 모를 극단적 상황(수만 건) 대비 최종 안전장치
-  const HARD_SAFETY_CAP = 5000;
-  if (n > HARD_SAFETY_CAP) {
-    console.log(`[groupArticlesHybrid] 배치가 ${n}건으로 너무 커서 임베딩 전용 방식으로 대체`);
-    return groupArticlesByEmbedding(articles, embeddingThreshold, timeWindowHours);
+  // 안전장치: 코사인 유사도 비교(쌍마다 1024차원 내적)는 쌍 하나하나가 비싸서, 시간창 안에
+  // 기사가 몇백 건만 몰려도(예: n=992 → 46만 쌍) Workers 무료 플랜의 CPU 10ms 제한을 그냥 넘겨버린다
+  // (실측: n=992에서 "Worker exceeded CPU time limit" 확인). 그래서 배치가 크면 임베딩 비교 없이
+  // 단어겹침 전용(groupArticles, 역색인 기반이라 훨씬 저렴)으로 대체한다.
+  // (호출부인 index.js도 이 상수를 보고 임베딩 JSON.parse 자체를 생략하므로, 값을 바꾸면 두 곳의
+  //  동작이 함께 바뀐다.)
+  if (n > HYBRID_EMBEDDING_MAX_N) {
+    console.log(`[groupArticlesHybrid] 배치가 ${n}건으로 너무 커서 단어겹침 전용 방식으로 대체 (코사인 비교 비용 회피)`);
+    return groupArticles(articles, lexicalThreshold, timeWindowHours);
   }
 
   const parent = Array.from({ length: n }, (_, i) => i);

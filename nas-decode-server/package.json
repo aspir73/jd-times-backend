@@ -1,0 +1,14 @@
+{
+  "name": "jd-times-decode-server",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "NAS 등 가정용 IP에서 돌리는 구글 뉴스 링크 디코딩 전용 릴레이 서버",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

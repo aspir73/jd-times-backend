@@ -1,5 +1,5 @@
 import { fetchArticlesForFeed } from './rss.js';
-import { groupArticles, groupArticlesHybrid } from './grouping.js';
+import { groupArticles, groupArticlesHybrid, HYBRID_EMBEDDING_MAX_N } from './grouping.js';
 import { hashArticleId } from './utils/hash.js';
 import { formatKstDisplay } from './utils/kstDisplay.js';
 import { decodeGoogleNewsUrl } from './utils/googleNewsDecoder.js';
@@ -40,16 +40,14 @@ function buildGoogleRssUrl(keyword) {
   return `https://news.google.com/rss/search?q=${q}&hl=ko&gl=KR&ceid=KR:ko`;
 }
 
-/** 아카이브 DB row(snake_case)를 프론트에서 쓰는 article 포맷(camelCase)으로 변환 */
+/**
+ * 아카이브 DB row(snake_case)를 프론트에서 쓰는 article 포맷(camelCase)으로 변환.
+ * 주의: embedding은 여기서 JSON.parse하지 않고 원문 문자열 그대로 둔다 — bge-m3 벡터(1024차원)
+ * JSON을 매 요청마다 수백~수천 건씩 파싱하는 게 CPU 비용의 대부분을 차지했었다(실측 확인).
+ * 실제로 임베딩 기반 클러스터링에 쓰일 때만(parseEmbeddingIfNeeded 참고) 그때 가서 파싱한다.
+ * 어차피 클러스터 응답(strip)에서 embedding 필드는 항상 제거되므로 프론트에는 영향 없다.
+ */
 function archivedRowToArticle(row) {
-  let embedding = null;
-  if (row.embedding) {
-    try {
-      embedding = JSON.parse(row.embedding);
-    } catch {
-      embedding = null;
-    }
-  }
   return {
     articleId: row.article_id,
     feedId: row.feed_id,
@@ -60,11 +58,25 @@ function archivedRowToArticle(row) {
     category: row.category || '일반',
     pubDate: row.pub_date || '',
     summary: row.summary || '',
-    embedding,
+    embedding: row.embedding || null, // 아직 JSON 문자열 그대로 (미파싱)
   };
 }
 
-const DEFAULT_WINDOW_HOURS = 24 * 3; // 기본 표시 기간: 3일
+/** priorityArticles가 hybrid 클러스터링의 임베딩 상한 이내일 때만, 그 안전한 개수만큼만 파싱한다 */
+function parseEmbeddingsIfWithinBudget(priorityArticles) {
+  if (priorityArticles.length > HYBRID_EMBEDDING_MAX_N) return; // 어차피 단어겹침 전용으로 처리되어 임베딩 미사용
+  for (const a of priorityArticles) {
+    if (typeof a.embedding === 'string') {
+      try {
+        a.embedding = JSON.parse(a.embedding);
+      } catch {
+        a.embedding = null;
+      }
+    }
+  }
+}
+
+const DEFAULT_WINDOW_HOURS = 24 * 2; // 기본 표시 기간: 2일 (Workers 무료 플랜 CPU 10ms 예산 안에서 안정적으로 처리 가능한 기사 수로 맞춤)
 
 /** '보안'/'LG전자' 피드(feed_title 기준) — 임베딩 클러스터링 대상 & 매일 9시 스크랩/북마크 리셋 대상 */
 const PRIORITY_FEED_TITLES = ['보안', 'LG전자'];
@@ -127,9 +139,13 @@ async function handleGetRss(request, env, ctx) {
   );
 
   // 2) 아카이브에서 같은 피드들의 과거 기사 조회 후 병합 (최신 실시간 데이터가 우선, 임베딩은 있으면 이어받음)
+  // 기간 필터와 같은 기준(windowHours)으로 DB 단에서부터 걸러서, 화면에 안 쓰일 기간 밖 기사까지
+  // 매번 통째로 읽어와 처리하는 낭비를 없앤다(아카이브가 쌓일수록 CPU 제한을 넘기는 주요 원인이었다).
+  const archiveSinceEpoch = windowHours !== null ? Date.now() - windowHours * 60 * 60 * 1000 : null;
   const archivedRows = await getArchivedArticles(
     env.DB,
-    feeds.map((f) => f.id)
+    feeds.map((f) => f.id),
+    archiveSinceEpoch
   );
   const archivedMap = new Map(archivedRows.map((row) => [row.article_id, archivedRowToArticle(row)]));
 
@@ -152,31 +168,15 @@ async function handleGetRss(request, env, ctx) {
     });
   }
 
-  // 4) '보안'/'LG전자' 카테고리 기사만 임베딩 계산 대상으로 삼는다 — Workers AI 호출량을 최소화해서
-  //    무료 사용량 안에서 계속 쓸 수 있도록 하기 위함. 나머지 카테고리는 AI 호출 없이 기존 단어겹침 방식 사용.
+  // 4) '보안'/'LG전자' 카테고리 기사만 임베딩 기반(의미 유사) 클러스터링 대상으로 삼는다.
+  //    나머지 카테고리는 기존 단어겹침 방식 사용.
+  //    주의: 임베딩 계산(Workers AI 호출)은 여기서 실시간으로 하지 않는다 — Workers 무료 플랜의
+  //    CPU 10ms 제한을 넘겨서 요청 자체가 503(Exceeded CPU Limit)으로 죽는 문제가 있었다.
+  //    대신 3시간마다(오전 6~9시는 30분마다) 도는 Cron(runScheduledArchive)이 백그라운드에서
+  //    미리 계산해 아카이브에 저장해두고, 여기서는 그 캐시된 값만 이어받는다. 그래서 방금 수집된
+  //    기사는 다음 Cron 주기까지 임베딩이 없을 수 있고, 그동안은 단어겹침 신호만으로 클러스터링된다.
   const priorityArticles = allArticles.filter((a) => PRIORITY_FEED_TITLES.includes(a.feedTitle));
   const otherArticles = allArticles.filter((a) => !PRIORITY_FEED_TITLES.includes(a.feedTitle));
-
-  // 실시간 요청(사용자가 새로고침 누르는 순간) 안에서는 소량만 즉석 계산해서 응답이 오래 안 걸리게 한다.
-  // 나머지(대부분)는 3시간마다 도는 Cron이 백그라운드에서 미리 채워두고, 다음 요청부터는 캐시를 그대로 쓴다.
-  const MAX_SYNC_EMBEDDINGS = 20;
-  const missingEmbeddingArticles = priorityArticles.filter((a) => !a.embedding).slice(0, MAX_SYNC_EMBEDDINGS);
-  if (missingEmbeddingArticles.length > 0) {
-    console.log('[embedding] 실시간 계산 대상(최대 20건 제한):', missingEmbeddingArticles.length, '건');
-    const vectors = await computeEmbeddings(
-      env.AI,
-      missingEmbeddingArticles.map((a) => a.title)
-    );
-    const successCount = vectors.filter((v) => v).length;
-    console.log('[embedding] 성공:', successCount, '/', vectors.length);
-    missingEmbeddingArticles.forEach((a, i) => {
-      a.embedding = vectors[i] ?? null;
-    });
-  }
-
-  // 방금 계산한 임베딩을 freshArticles 쪽에도 반영 (같은 객체 참조가 아닐 수 있어 articleId로 매칭)
-  const embeddingById = new Map(priorityArticles.map((a) => [a.articleId, a.embedding]));
-  freshArticles = freshArticles.map((a) => ({ ...a, embedding: embeddingById.get(a.articleId) ?? a.embedding }));
 
   // 아카이브 반영은 응답을 기다리지 않고 백그라운드로 처리 (실패해도 응답에는 영향 없음)
   // 시간창 필터와 무관하게 이번에 새로 수집한 기사는 전부 저장 — "전체 기간" 검색의 완전성을 위해
@@ -188,6 +188,7 @@ async function handleGetRss(request, env, ctx) {
   priorityArticles.sort((a, b) => new Date(b.pubDate).getTime() - new Date(a.pubDate).getTime());
   otherArticles.sort((a, b) => new Date(b.pubDate).getTime() - new Date(a.pubDate).getTime());
 
+  parseEmbeddingsIfWithinBudget(priorityArticles);
   const priorityClusters = groupArticlesHybrid(priorityArticles);
   const otherClusters = groupArticles(otherArticles);
 
@@ -386,7 +387,7 @@ async function handleAddPick(request, env) {
   }
 
   // 구글 뉴스 리다이렉트 링크면 원본 기사 URL로 디코딩 시도 (실패해도 조용히 원본 링크 유지)
-  const resolvedLink = await decodeGoogleNewsUrl(link);
+  const resolvedLink = await decodeGoogleNewsUrl(link, env);
 
   const result = await addPick(env.DB, { ...body, link: resolvedLink });
   return json(result, 201);
@@ -430,14 +431,14 @@ async function handleGetPicks(request, env) {
     sinceIso = new Date(Date.now() - PERIOD_HOURS[period] * 60 * 60 * 1000).toISOString();
   }
 
+  // link 디코딩은 스크랩 시점(handleAddPick)에 이미 끝난 상태 — 조회할 때마다 다시 시도하면
+  // (구글의 비공식 batchexecute API가 실패할 경우) 기사 하나당 최대 10번까지 순차 재시도가 붙어서
+  // Today/주간/월간 조회 자체가 몇십 초씩 걸리는 문제가 있었다(실측 확인).
   const picks = await getPicks(env.DB, sinceIso);
-  const picksWithDisplay = await Promise.all(
-    picks.map(async (p) => ({
-      ...p,
-      link: await decodeGoogleNewsUrl(p.link),
-      pub_date_display: formatKstDisplay(p.pub_date),
-    }))
-  );
+  const picksWithDisplay = picks.map((p) => ({
+    ...p,
+    pub_date_display: formatKstDisplay(p.pub_date),
+  }));
   return json({ picks: picksWithDisplay });
 }
 

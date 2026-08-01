@@ -35,3 +35,11 @@ crons = ["0 */3 * * *", "*/30 21-23 * * *", "0 0 * * *"]
 # 6. Workers AI 바인딩 - 임베딩 기반 유사기사 클러스터링용 (별도 API 키 불필요, 사용량 기반 소액 과금)
 [ai]
 binding = "AI"
+
+# 7. (선택) 구글 뉴스 링크 디코딩용 NAS 릴레이 서버 - 구글이 Cloudflare Workers IP를 차단해서
+#    (실측: news.google.com 기사 페이지 요청이 항상 503) 스크랩 시 원본 링크 대신 구글 리다이렉트
+#    링크가 저장되는 문제가 있었다. nas-decode-server/를 가정용 IP(NAS)에서 돌리고 이 값들을
+#    설정하면, 스크랩할 때 그 서버를 거쳐 원본 링크로 디코딩한다. 설정 안 하면 기존 방식(Worker가
+#    직접 구글에 요청, 대부분 실패)으로 조용히 폴백한다.
+# 설정: wrangler secret put DECODE_PROXY_URL   (예: https://gnews-decode.<도메인>/decode)
+#       wrangler secret put DECODE_PROXY_TOKEN (nas-decode-server의 DECODE_TOKEN과 동일한 값)

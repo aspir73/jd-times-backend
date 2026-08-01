@@ -8,18 +8,31 @@
  * 내부 batchexecute API를 호출하는 방식(커뮤니티에서 리버스 엔지니어링됨)을 쓴다.
  *
  * 실패할 수 있다는 전제로 항상 안전하게 폴백하도록 작성했다:
- * 1) batchexecute API 시도 → 실패 시
+ * 0) (설정된 경우) NAS 등 가정용 IP에서 돌아가는 전용 릴레이 서버 경유 시도 → 실패 시
+ * 1) batchexecute API 직접 호출 시도 → 실패 시
  * 2) 일반 HTTP 리다이렉트를 그냥 따라가 보기(가끔 통할 때가 있음) → 그래도 실패 시
  * 3) 원본 구글 링크 그대로 반환
  *
+ * 0)이 있는 이유: 구글이 Cloudflare Workers의 IP 대역에서 오는 news.google.com 요청을
+ * 차단한다(실측 확인 — 503 응답, 같은 헤더로 일반 IP에서 보내면 정상 동작함). 그래서 1)/2)는
+ * Worker에서 직접 실행하면 사실상 항상 실패하고, 0)이 설정돼 있으면 그게 주로 쓰이게 된다.
+ * 0)이 설정 안 돼 있거나(env.DECODE_PROXY_URL 없음) 실패하면 그대로 1)/2)/3)으로 넘어간다.
+ *
  * 호출 비용이 있으므로(요청 여러 번) 브라우즈 화면 전체 기사가 아니라 "스크랩" 시점에만 사용한다.
+ * @param {string} googleUrl
+ * @param {{DECODE_PROXY_URL?: string, DECODE_PROXY_TOKEN?: string}} [env]
  */
-export async function decodeGoogleNewsUrl(googleUrl) {
+export async function decodeGoogleNewsUrl(googleUrl, env = {}) {
   try {
     if (!googleUrl) return googleUrl;
 
     const url = new URL(googleUrl);
     if (!isGoogleNewsHost(url.hostname)) return googleUrl;
+
+    if (env.DECODE_PROXY_URL) {
+      const viaNas = await decodeViaNasProxy(googleUrl, env);
+      if (viaNas) return normalizeUrl(viaNas);
+    }
 
     const gnArtId = extractGoogleNewsArticleId(url);
     if (!gnArtId) {
@@ -39,6 +52,38 @@ export async function decodeGoogleNewsUrl(googleUrl) {
   } catch (err) {
     console.log('[decodeGoogleNewsUrl] 예외 발생:', String(err));
     return googleUrl;
+  }
+}
+
+/** 0차 시도: NAS 등 가정용 IP에서 돌아가는 전용 릴레이 서버(nas-decode-server) 경유 */
+async function decodeViaNasProxy(googleUrl, env) {
+  try {
+    const proxyUrl = new URL(env.DECODE_PROXY_URL);
+    proxyUrl.searchParams.set('url', googleUrl);
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 8000);
+    try {
+      const res = await fetch(proxyUrl.toString(), {
+        headers: env.DECODE_PROXY_TOKEN ? { Authorization: `Bearer ${env.DECODE_PROXY_TOKEN}` } : {},
+        signal: controller.signal,
+      });
+      if (!res.ok) {
+        console.log('[decodeGoogleNewsUrl] NAS 프록시 실패, status:', res.status);
+        return null;
+      }
+      const data = await res.json();
+      if (data?.url && typeof data.url === 'string' && data.url.startsWith('http')) {
+        console.log('[decodeGoogleNewsUrl] NAS 프록시 성공:', data.url);
+        return data.url;
+      }
+      return null;
+    } finally {
+      clearTimeout(timer);
+    }
+  } catch (err) {
+    console.log('[decodeGoogleNewsUrl] NAS 프록시 예외:', String(err));
+    return null;
   }
 }
 

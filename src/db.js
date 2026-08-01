@@ -137,6 +137,17 @@ export async function getStatusMap(db, articleIds) {
 }
 
 /**
+ * article.embedding을 DB 저장용 문자열로 변환.
+ * embedding은 두 가지 형태로 들어올 수 있다: 아카이브에서 그대로 이어받은 미파싱 JSON 문자열,
+ * 또는 이번 요청/Cron에서 새로 계산된 숫자 배열. 문자열이면 이미 저장 가능한 형태이므로 그대로
+ * 두고(다시 JSON.stringify하면 이중 인코딩되어 값이 깨진다), 배열이면 새로 stringify한다.
+ */
+function toEmbeddingColumn(embedding) {
+  if (embedding == null) return null;
+  return typeof embedding === 'string' ? embedding : JSON.stringify(embedding);
+}
+
+/**
  * 기사 배열을 아카이브에 upsert (있으면 last_seen_at만 갱신, 없으면 신규 삽입).
  * 배치를 너무 크게 묶으면 D1 제한에 걸릴 수 있어 작은 청크로 나눠 처리.
  */
@@ -148,12 +159,13 @@ export async function upsertArchivedArticles(db, articles) {
     const chunk = articles.slice(i, i + CHUNK);
     const statements = chunk
       .filter((a) => a.articleId && a.title && a.link)
-      .map((a) =>
-        db
+      .map((a) => {
+        const epoch = a.pubDate ? Date.parse(a.pubDate) : NaN;
+        return db
           .prepare(
             `INSERT INTO archived_articles
-               (article_id, feed_id, feed_title, title, link, source, category, pub_date, summary, embedding, first_seen_at, last_seen_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+               (article_id, feed_id, feed_title, title, link, source, category, pub_date, pub_date_epoch, summary, embedding, first_seen_at, last_seen_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
              ON CONFLICT(article_id) DO UPDATE SET
                title = excluded.title,
                summary = excluded.summary,
@@ -169,18 +181,29 @@ export async function upsertArchivedArticles(db, articles) {
             a.source ?? '',
             a.category ?? '일반',
             a.pubDate ?? '',
+            Number.isFinite(epoch) ? epoch : null,
             a.summary ?? '',
-            a.embedding ? JSON.stringify(a.embedding) : null
-          )
-      );
+            toEmbeddingColumn(a.embedding)
+          );
+      });
     if (statements.length > 0) await db.batch(statements);
   }
 }
 
-/** 특정 feed_id 목록(또는 전체)에 대한 아카이브 기사 조회 */
-export async function getArchivedArticles(db, feedIds) {
+/**
+ * 특정 feed_id 목록(또는 전체)에 대한 아카이브 기사 조회.
+ * @param {number|null} sinceEpoch - 주어지면 이 시각(ms) 이후 pub_date_epoch만 조회 — 화면에 안 쓰일
+ *   기간 밖 기사까지 매번 통째로 읽어와 처리하던 CPU 낭비를 없애기 위함(실측으로 확인된 병목).
+ *   pub_date를 파싱 못해 pub_date_epoch이 NULL인 행은 기존 JS 필터와 동일하게 제외된다.
+ */
+export async function getArchivedArticles(db, feedIds, sinceEpoch = null) {
+  const epochClause = sinceEpoch !== null ? ' AND pub_date_epoch >= ?' : '';
+
   if (!feedIds || feedIds.length === 0) {
-    const { results } = await db.prepare('SELECT * FROM archived_articles').all();
+    const query = sinceEpoch !== null
+      ? db.prepare('SELECT * FROM archived_articles WHERE pub_date_epoch >= ?').bind(sinceEpoch)
+      : db.prepare('SELECT * FROM archived_articles');
+    const { results } = await query.all();
     return results;
   }
 
@@ -189,9 +212,10 @@ export async function getArchivedArticles(db, feedIds) {
   for (let i = 0; i < feedIds.length; i += CHUNK_SIZE) {
     const chunk = feedIds.slice(i, i + CHUNK_SIZE);
     const placeholders = chunk.map(() => '?').join(',');
+    const bindArgs = sinceEpoch !== null ? [...chunk, sinceEpoch] : chunk;
     const { results } = await db
-      .prepare(`SELECT * FROM archived_articles WHERE feed_id IN (${placeholders})`)
-      .bind(...chunk)
+      .prepare(`SELECT * FROM archived_articles WHERE feed_id IN (${placeholders})${epochClause}`)
+      .bind(...bindArgs)
       .all();
     all = all.concat(results);
   }
