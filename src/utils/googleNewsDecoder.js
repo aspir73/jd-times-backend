@@ -16,11 +16,17 @@
  * 0)이 있는 이유: 구글이 Cloudflare Workers의 IP 대역에서 오는 news.google.com 요청을
  * 차단한다(실측 확인 — 503 응답, 같은 헤더로 일반 IP에서 보내면 정상 동작함). 그래서 1)/2)는
  * Worker에서 직접 실행하면 사실상 항상 실패하고, 0)이 설정돼 있으면 그게 주로 쓰이게 된다.
- * 0)이 설정 안 돼 있거나(env.DECODE_PROXY_URL 없음) 실패하면 그대로 1)/2)/3)으로 넘어간다.
+ * 0)이 설정 안 돼 있거나(KV에 주소 없음) 실패하면 그대로 1)/2)/3)으로 넘어간다.
+ *
+ * NAS 릴레이 주소는 wrangler secret이 아니라 KV(env.RSS_CACHE, 키 `system:decode_proxy_url`)에서
+ * 읽는다. Cloudflare Quick Tunnel은 예고 없이 세션이 끊기고 그때마다 주소가 바뀌는데, NAS의
+ * watchdog(nas-decode-server/watchdog.js)가 끊긴 걸 감지하면 재연결 후 새 주소를 이 KV 키에
+ * 직접 써준다 — Worker를 재배포하거나 시크릿을 수동으로 갱신할 필요 없이 다음 요청부터 바로
+ * 새 주소를 쓰게 된다. 인증 토큰(DECODE_PROXY_TOKEN)은 바뀌지 않으므로 그대로 secret으로 둔다.
  *
  * 호출 비용이 있으므로(요청 여러 번) 브라우즈 화면 전체 기사가 아니라 "스크랩" 시점에만 사용한다.
  * @param {string} googleUrl
- * @param {{DECODE_PROXY_URL?: string, DECODE_PROXY_TOKEN?: string}} [env]
+ * @param {{RSS_CACHE: KVNamespace, DECODE_PROXY_TOKEN?: string}} [env]
  */
 export async function decodeGoogleNewsUrl(googleUrl, env = {}) {
   try {
@@ -29,10 +35,8 @@ export async function decodeGoogleNewsUrl(googleUrl, env = {}) {
     const url = new URL(googleUrl);
     if (!isGoogleNewsHost(url.hostname)) return googleUrl;
 
-    if (env.DECODE_PROXY_URL) {
-      const viaNas = await decodeViaNasProxy(googleUrl, env);
-      if (viaNas) return normalizeUrl(viaNas);
-    }
+    const viaNas = await decodeViaNasProxy(googleUrl, env);
+    if (viaNas) return normalizeUrl(viaNas);
 
     const gnArtId = extractGoogleNewsArticleId(url);
     if (!gnArtId) {
@@ -55,10 +59,15 @@ export async function decodeGoogleNewsUrl(googleUrl, env = {}) {
   }
 }
 
+const DECODE_PROXY_URL_KV_KEY = 'system:decode_proxy_url';
+
 /** 0차 시도: NAS 등 가정용 IP에서 돌아가는 전용 릴레이 서버(nas-decode-server) 경유 */
 async function decodeViaNasProxy(googleUrl, env) {
   try {
-    const proxyUrl = new URL(env.DECODE_PROXY_URL);
+    const proxyUrlRaw = env.RSS_CACHE ? await env.RSS_CACHE.get(DECODE_PROXY_URL_KV_KEY) : null;
+    if (!proxyUrlRaw) return null;
+
+    const proxyUrl = new URL(proxyUrlRaw);
     proxyUrl.searchParams.set('url', googleUrl);
 
     const controller = new AbortController();

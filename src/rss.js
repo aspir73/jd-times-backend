@@ -1,10 +1,17 @@
 /**
  * RSS 프록시 수집기
  * - 구글 봇 차단(403/429) 회피를 위한 User-Agent / Header 위장
- * - Cloudflare KV에 15분(900초) 캐싱하여 구글 서버 직접 요청 최소화
+ * - Cloudflare KV에 15분(900초) 신선도 기준으로 캐싱하여 구글 서버 직접 요청 최소화
+ * - stale-while-revalidate: direct fetch와 rss2json 대체 경로를 모두 시도했는데도 둘 다
+ *   실패/타임아웃일 때만, 마지막 수단으로 만료된 캐시를 서빙한다(fetchArticlesForFeed 참고).
+ *   주의: fetchRssWithCache/fetchViaRss2Json 각각의 내부에서 실패를 삼키고 캐시로 폴백하면 안
+ *   된다 — 그러면 direct가 실패해도 "성공"한 것처럼 보여서 rss2json 쪽을 아예 시도하지 못하고,
+ *   결과적으로 새 기사가 있어도 계속 예전 캐시만 보여주는 문제가 생긴다(실제로 겪었던 버그).
  */
 
-const CACHE_TTL_SECONDS = 900; // 15분
+const CACHE_FRESH_SECONDS = 900; // 15분 이내면 신선하다고 보고 캐시를 그대로 서빙
+const CACHE_STORAGE_SECONDS = 60 * 60 * 24 * 3; // KV 보관 기간(신선도와 별개, 완전 유실 방지용 안전판) — 3일
+const FETCH_TIMEOUT_MS = 6000; // 구글 응답이 느릴 때 무한정 기다리지 않기 위한 타임아웃
 
 const DESKTOP_CHROME_HEADERS = {
   'User-Agent':
@@ -30,8 +37,35 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+async function fetchWithTimeout(url, options, timeoutMs) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** 캐시 항목을 읽는다 (신선도와 무관하게 있으면 반환, 형식이 깨졌으면 null) */
+async function readCacheEntry(kv, cacheKey) {
+  const raw = await kv.get(cacheKey);
+  if (!raw) return null;
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return null; // 예전 포맷(순수 XML 문자열) 등 — 캐시 없는 것으로 취급
+  }
+}
+
+function isFreshEntry(entry) {
+  return !!entry?.fetchedAt && Date.now() - entry.fetchedAt < CACHE_FRESH_SECONDS * 1000;
+}
+
 /**
- * KV 캐시를 우선 조회하고, 없으면 원본 RSS를 fetch 후 캐싱.
+ * KV 캐시가 신선하면(15분 이내) 그대로 반환, 아니면(또는 force) 실시간으로 새로 받아온다.
+ * 실시간 fetch가 실패/타임아웃이면 예외를 던진다 — 캐시 폴백은 여기서 하지 않고
+ * fetchArticlesForFeed가 rss2json까지 다 시도해본 뒤 최종적으로 처리한다.
  * @param {string} rssUrl
  * @param {KVNamespace} kv - env.RSS_CACHE 바인딩
  * @returns {Promise<string>} 원본 XML 텍스트
@@ -40,29 +74,32 @@ export async function fetchRssWithCache(rssUrl, kv, force = false) {
   const cacheKey = `rss:${rssUrl}`;
 
   if (!force) {
-    const cached = await kv.get(cacheKey);
-    if (cached) {
-      return cached;
-    }
+    const cached = await readCacheEntry(kv, cacheKey);
+    if (isFreshEntry(cached)) return cached.xml;
   }
 
-  const MAX_ATTEMPTS = 3;
+  const MAX_ATTEMPTS = 2; // 타임아웃이 있으니 재시도는 줄여서 최악의 대기 시간을 제한
   let lastError;
 
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-    const res = await fetch(rssUrl, { headers: DESKTOP_CHROME_HEADERS });
+    let res;
+    try {
+      res = await fetchWithTimeout(rssUrl, { headers: DESKTOP_CHROME_HEADERS }, FETCH_TIMEOUT_MS);
+    } catch (err) {
+      lastError = err; // 타임아웃(AbortError) 포함 — 계속 느릴 가능성이 높으므로 재시도하지 않고 종료
+      break;
+    }
 
     if (res.ok) {
       const xmlText = await res.text();
-      await kv.put(cacheKey, xmlText, { expirationTtl: CACHE_TTL_SECONDS });
+      await kv.put(cacheKey, JSON.stringify({ xml: xmlText, fetchedAt: Date.now() }), {
+        expirationTtl: CACHE_STORAGE_SECONDS,
+      });
       return xmlText;
     }
 
     lastError = new Error(`RSS fetch failed (${res.status}): ${rssUrl}`);
-
-    if (!RETRYABLE_STATUS.has(res.status) || attempt === MAX_ATTEMPTS) {
-      throw lastError;
-    }
+    if (!RETRYABLE_STATUS.has(res.status) || attempt === MAX_ATTEMPTS) break;
 
     // 지수 백오프: 500ms, 1500ms
     await sleep(500 * Math.pow(3, attempt - 1));
@@ -80,11 +117,10 @@ export async function fetchRssWithCache(rssUrl, kv, force = false) {
  */
 export async function fetchViaRss2Json(rssUrl, apiKey, kv, force = false) {
   const cacheKey = `rss2json:${rssUrl}`;
+
   if (!force) {
-    const cached = await kv.get(cacheKey);
-    if (cached) {
-      return JSON.parse(cached);
-    }
+    const cached = await readCacheEntry(kv, cacheKey);
+    if (isFreshEntry(cached)) return cached.items;
   }
 
   const proxyUrl = new URL('https://api.rss2json.com/v1/api.json');
@@ -96,7 +132,7 @@ export async function fetchViaRss2Json(rssUrl, apiKey, kv, force = false) {
     proxyUrl.searchParams.set('order_dir', 'desc');
   }
 
-  const res = await fetch(proxyUrl.toString());
+  const res = await fetchWithTimeout(proxyUrl.toString(), {}, FETCH_TIMEOUT_MS);
   if (!res.ok) {
     throw new Error(`rss2json fetch failed (${res.status}): ${rssUrl}`);
   }
@@ -106,7 +142,9 @@ export async function fetchViaRss2Json(rssUrl, apiKey, kv, force = false) {
     throw new Error(`rss2json returned error: ${data.message || 'unknown'}`);
   }
 
-  await kv.put(cacheKey, JSON.stringify(data.items), { expirationTtl: CACHE_TTL_SECONDS });
+  await kv.put(cacheKey, JSON.stringify({ items: data.items, fetchedAt: Date.now() }), {
+    expirationTtl: CACHE_STORAGE_SECONDS,
+  });
   return data.items;
 }
 
@@ -143,25 +181,73 @@ export function parseRss2JsonItems(items, feedMeta = {}) {
 }
 
 /**
+ * direct/rss2json 둘 다 실시간 수집에 실패했을 때 마지막 수단으로 쓰는 폴백.
+ * 두 캐시(direct, rss2json) 중 더 최근에 갱신된 쪽을 골라서 서빙한다 — 데이터 없이 실패하는
+ * 것보다는 오래된 기사라도 보여주는 게 낫기 때문. 어느 쪽 캐시도 없으면 그제서야 예외를 던진다.
+ */
+async function fallbackToStaleCache(env, feed, feedMeta) {
+  const directEntry = await readCacheEntry(env.RSS_CACHE, `rss:${feed.rss_url}`);
+  const rss2jsonEntry = env.RSS2JSON_API_KEY
+    ? await readCacheEntry(env.RSS_CACHE, `rss2json:${feed.rss_url}`)
+    : null;
+
+  const directTime = directEntry?.fetchedAt ?? -1;
+  const rss2jsonTime = rss2jsonEntry?.fetchedAt ?? -1;
+
+  if (directTime < 0 && rss2jsonTime < 0) {
+    throw new Error(`실시간 수집 실패, 캐시도 없음: ${feed.rss_url}`);
+  }
+
+  if (directTime >= rss2jsonTime) {
+    console.log('[rss] 실시간 수집 실패 — 오래된 캐시로 폴백(direct):', feed.rss_url, new Date(directTime).toISOString());
+    return parseRssItems(directEntry.xml, feedMeta);
+  }
+  console.log('[rss] 실시간 수집 실패 — 오래된 캐시로 폴백(rss2json):', feed.rss_url, new Date(rss2jsonTime).toISOString());
+  return parseRss2JsonItems(rss2jsonEntry.items, feedMeta);
+}
+
+/**
  * 피드 하나에 대해 기사를 수집하는 최상위 함수.
- * 1) 직접 fetch(+재시도) 시도 → 실패 시
- * 2) RSS2JSON_API_KEY가 설정되어 있으면 rss2json.com 경유로 재시도
+ * 0) 직접 fetch 캐시, rss2json 캐시 중 신선한(15분 이내) 게 있으면 바로 사용 — 구글이 특정
+ *    피드에서 계속 느릴 때(실측: 27~30초) 이미 신선한 대체 캐시가 있는데도 매번 direct fetch
+ *    타임아웃(6초)을 다시 치르는 낭비를 막기 위함.
+ * 1) 없으면(또는 force) 직접 fetch를 실시간으로 시도 → 실패 시
+ * 2) RSS2JSON_API_KEY가 설정되어 있으면 rss2json.com 경유로 실시간 재시도 → 그래도 실패 시
+ * 3) 마지막 수단으로 오래된 캐시 서빙 (fallbackToStaleCache)
+ *
+ * 주의: 1)/2) 각각에서 실패를 조용히 캐시로 무마하면 안 된다 — direct가 막혀도 "성공"한 것처럼
+ * 보여서 rss2json을 아예 시도하지 못하고, 결과적으로 새 기사가 있어도 계속 예전 캐시만 보여주는
+ * 문제가 생긴다(실제로 겪은 버그: 구글에 새 기사가 있는데도 8시간 넘게 업데이트가 안 됨).
  * @param {{id, rss_url, title, category}} feed
  * @param {{RSS_CACHE: KVNamespace, RSS2JSON_API_KEY?: string}} env
  */
 export async function fetchArticlesForFeed(feed, env, force = false) {
   const feedMeta = { id: feed.id, title: feed.title, category: feed.category };
 
+  if (!force) {
+    const freshDirect = await readCacheEntry(env.RSS_CACHE, `rss:${feed.rss_url}`);
+    if (isFreshEntry(freshDirect)) return parseRssItems(freshDirect.xml, feedMeta);
+
+    if (env.RSS2JSON_API_KEY) {
+      const freshRss2json = await readCacheEntry(env.RSS_CACHE, `rss2json:${feed.rss_url}`);
+      if (isFreshEntry(freshRss2json)) return parseRss2JsonItems(freshRss2json.items, feedMeta);
+    }
+  }
+
   try {
-    const xml = await fetchRssWithCache(feed.rss_url, env.RSS_CACHE, force);
+    // 신선한 캐시가 없다고 이미 확인했으니(또는 force) 항상 실시간으로 시도
+    const xml = await fetchRssWithCache(feed.rss_url, env.RSS_CACHE, true);
     return parseRssItems(xml, feedMeta);
   } catch (directError) {
     if (!env.RSS2JSON_API_KEY) {
-      throw directError;
+      return fallbackToStaleCache(env, feed, feedMeta);
     }
-    // 직접 fetch 실패 시 rss2json.com 프록시로 대체 시도
-    const items = await fetchViaRss2Json(feed.rss_url, env.RSS2JSON_API_KEY, env.RSS_CACHE, force);
-    return parseRss2JsonItems(items, feedMeta);
+    try {
+      const items = await fetchViaRss2Json(feed.rss_url, env.RSS2JSON_API_KEY, env.RSS_CACHE, true);
+      return parseRss2JsonItems(items, feedMeta);
+    } catch {
+      return fallbackToStaleCache(env, feed, feedMeta);
+    }
   }
 }
 
