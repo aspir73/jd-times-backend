@@ -81,8 +81,15 @@ async function checkHealth(baseUrl) {
   }
 }
 
+// cloudflared가 새 Quick Tunnel을 요청할 때 자기 자신의 제어용 API 호스트(api.trycloudflare.com)를
+// 로그에 남기는데, 이게 실제 터널 주소와 같은 패턴(https://<word>.trycloudflare.com)이라
+// (DNS 타임아웃 등으로) 요청이 실패한 줄에서도 매치되어 버렸다. 실제 터널 서브도메인은 항상
+// 무작위 영단어 조합(예: experiences-speaking-venture-historic)이라 절대 "api" 한 단어로만
+// 오지 않으므로, 제어용 호스트를 명시적으로 제외한다.
 function extractLatestTunnelUrl(logText) {
-  const matches = [...logText.matchAll(/https:\/\/[a-z0-9-]+\.trycloudflare\.com/g)];
+  const matches = [...logText.matchAll(/https:\/\/([a-z0-9-]+)\.trycloudflare\.com/g)].filter(
+    (m) => m[1] !== 'api'
+  );
   return matches.length > 0 ? matches[matches.length - 1][0] : null;
 }
 
