@@ -43,3 +43,8 @@ binding = "AI"
 #    직접 구글에 요청, 대부분 실패)으로 조용히 폴백한다.
 # 설정: wrangler secret put DECODE_PROXY_URL   (예: https://gnews-decode.<도메인>/decode)
 #       wrangler secret put DECODE_PROXY_TOKEN (nas-decode-server의 DECODE_TOKEN과 동일한 값)
+
+# 8. API 인증 - 개인용 단일 사용자 도구라 로그인 화면 없이 공유 비밀키 하나로 모든 엔드포인트를 보호한다.
+#    프론트엔드는 모든 요청에 X-API-Key 헤더로 이 값을 실어 보내야 한다(NEXT_PUBLIC_API_KEY).
+#    설정 안 하면(로컬 개발 등) 인증을 건너뛰므로, 운영 배포에는 반드시 설정할 것.
+# 설정: wrangler secret put API_KEY

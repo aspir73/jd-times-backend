@@ -25,8 +25,37 @@ import {
 const CORS_HEADERS = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Methods': 'GET, POST, PATCH, DELETE, OPTIONS',
-  'Access-Control-Allow-Headers': 'Content-Type',
+  'Access-Control-Allow-Headers': 'Content-Type, X-API-Key',
 };
+
+/**
+ * 요청 헤더의 X-API-Key와 env.API_KEY를 상수시간으로 비교.
+ * 둘 다 SHA-256으로 해시해서 길이를 고정시킨 뒤 바이트 단위로 비교하므로,
+ * 문자열 길이/내용에 따라 비교 시간이 달라지는 타이밍 사이드채널을 피한다.
+ */
+async function timingSafeEqual(a, b) {
+  const enc = new TextEncoder();
+  const [ha, hb] = await Promise.all([
+    crypto.subtle.digest('SHA-256', enc.encode(a)),
+    crypto.subtle.digest('SHA-256', enc.encode(b)),
+  ]);
+  const va = new Uint8Array(ha);
+  const vb = new Uint8Array(hb);
+  let diff = 0;
+  for (let i = 0; i < va.length; i++) diff |= va[i] ^ vb[i];
+  return diff === 0;
+}
+
+/**
+ * 이 앱은 개인용 단일 사용자 도구라 별도 로그인 화면 없이 공유 비밀키(API_KEY) 하나로 보호한다.
+ * env.API_KEY가 설정 안 돼 있으면(로컬 개발 등) 인증을 건너뛴다 — 운영에서는 반드시
+ * `wrangler secret put API_KEY`로 설정해야 실제로 보호된다.
+ */
+async function checkApiKey(request, env) {
+  if (!env.API_KEY) return true;
+  const provided = request.headers.get('X-API-Key') || '';
+  return timingSafeEqual(provided, env.API_KEY);
+}
 
 function json(data, status = 200) {
   return new Response(JSON.stringify(data), {
@@ -485,6 +514,10 @@ export default {
   async fetch(request, env, ctx) {
     if (request.method === 'OPTIONS') {
       return new Response(null, { headers: CORS_HEADERS });
+    }
+
+    if (!(await checkApiKey(request, env))) {
+      return json({ error: 'UNAUTHORIZED' }, 401);
     }
 
     const url = new URL(request.url);

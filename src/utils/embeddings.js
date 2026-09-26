@@ -10,7 +10,8 @@
  * @returns {Promise<(number[]|null)[]>} texts와 같은 순서/길이의 벡터 배열
  */
 export async function computeEmbeddings(ai, texts) {
-  if (!ai || !texts || texts.length === 0) return texts.map(() => null);
+  if (!texts || texts.length === 0) return [];
+  if (!ai) return texts.map(() => null);
 
   try {
     const result = await ai.run('@cf/baai/bge-m3', { text: texts });

@@ -18,6 +18,7 @@
  */
 
 import http from 'node:http';
+import { createHash, timingSafeEqual } from 'node:crypto';
 
 const TOKEN = process.env.DECODE_TOKEN;
 const PORT = Number(process.env.PORT) || 8787;
@@ -257,10 +258,13 @@ async function decodeGoogleNewsUrl(googleUrl) {
   return null;
 }
 
+/** SHA-256으로 길이를 고정시킨 뒤 timingSafeEqual로 비교 — 토큰 길이/내용에 따른 타이밍 사이드채널 방지 */
 function checkAuth(req) {
   const header = req.headers['authorization'] || '';
   const token = header.startsWith('Bearer ') ? header.slice(7) : '';
-  return token === TOKEN;
+  const a = createHash('sha256').update(token).digest();
+  const b = createHash('sha256').update(TOKEN).digest();
+  return timingSafeEqual(a, b);
 }
 
 const server = http.createServer(async (req, res) => {
