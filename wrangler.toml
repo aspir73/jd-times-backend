@@ -56,4 +56,4 @@ binding = "AI"
 #      데이터(피드/읽음/스크랩)는 여기 적힌 이메일로 처음 로그인한 계정에 연결된다. 이메일은 개인정보라 secret으로 등록.
 # 설정: wrangler secret put ADMIN_EMAILS
 [vars]
-GOOGLE_CLIENT_ID = ""
+GOOGLE_CLIENT_ID = "1022918442836-bkndh5gbt4kcoedrfodgvlp41hlh8foe.apps.googleusercontent.com"
