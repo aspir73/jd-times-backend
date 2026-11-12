@@ -199,7 +199,7 @@ export async function bulkUpsertArticleStatus(db, userId, articleIds, { isRead, 
 }
 
 /**
- * 매일 오전 9시(Today News 확정 시점) — 지정된 이름의 피드에 속한 기사의 스크랩/북마크 "표시 상태"를 초기화.
+ * 매일 오전 10시(Today News 확정 시점) — 지정된 이름의 피드에 속한 기사의 스크랩/북마크 "표시 상태"를 초기화.
  * 사용자마다 자기가 그 이름으로 구독한 피드 기준으로 적용된다.
  * 주의: Today News의 영구 기록(picked_articles)은 절대 건드리지 않는다. 어제자 다이제스트는
  * 그대로 보존되고, 여기서는 오직 브라우즈 화면에 보이는 실시간 별/리본 아이콘 상태만 리셋한다.

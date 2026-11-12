@@ -1,8 +1,11 @@
 /**
  * 스크랩 시각(KST) → "다이제스트 날짜(YYYY-MM-DD)" 계산.
- * 규칙: 오전 9시 이전 스크랩 = 그날 다이제스트 / 9시 이후 = 다음날 다이제스트.
+ * 규칙: 오전 10시(DIGEST_CUTOFF_HOUR) 이전 스크랩 = 그날 다이제스트 / 10시 이후 = 다음날 다이제스트.
  * 주말(토/일)에 해당하면 다음 월요일로 이월 (다이제스트는 평일만 존재).
+ * 프론트엔드 lib/digestDate.js와 wrangler.toml의 마감 Cron(01:00 UTC)도 같은 시각으로 맞춰야 한다.
  */
+export const DIGEST_CUTOFF_HOUR = 10;
+
 export function computeDigestDate(scrapedAtIso) {
   const d = new Date(scrapedAtIso);
   const parts = new Intl.DateTimeFormat('en-CA', {
@@ -22,7 +25,7 @@ export function computeDigestDate(scrapedAtIso) {
   if (hour === 24) hour = 0;
 
   const candidate = new Date(Date.UTC(y, m - 1, day));
-  if (hour >= 9) candidate.setUTCDate(candidate.getUTCDate() + 1);
+  if (hour >= DIGEST_CUTOFF_HOUR) candidate.setUTCDate(candidate.getUTCDate() + 1);
 
   const weekday = candidate.getUTCDay(); // 0=일, 6=토
   if (weekday === 6) candidate.setUTCDate(candidate.getUTCDate() + 2);

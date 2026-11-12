@@ -144,7 +144,7 @@ function parseEmbeddingsIfWithinBudget(priorityArticles) {
 
 const DEFAULT_WINDOW_HOURS = 24 * 2; // 기본 표시 기간: 2일 (Workers 무료 플랜 CPU 10ms 예산 안에서 안정적으로 처리 가능한 기사 수로 맞춤)
 
-/** '보안'/'LG전자' 피드(사용자가 정한 피드 이름 기준) — 임베딩 클러스터링 대상 & 매일 9시 스크랩/북마크 리셋 대상 */
+/** '보안'/'LG전자' 피드(사용자가 정한 피드 이름 기준) — 임베딩 클러스터링 대상 & 매일 10시 스크랩/북마크 리셋 대상 */
 const PRIORITY_FEED_TITLES = ['보안', 'LG전자'];
 
 /** 일반 사용자가 스스로 구독할 수 있는 피드 수 상한 (사용자가 늘어도 Cron 수집량이 폭증하지 않게). 어드민 API는 제한 없음 */
@@ -290,7 +290,7 @@ async function handleGetRss(request, env, ctx, user) {
   //    나머지는 기존 단어겹침 방식 사용.
   //    주의: 임베딩 계산(Workers AI 호출)은 여기서 실시간으로 하지 않는다 — Workers 무료 플랜의
   //    CPU 10ms 제한을 넘겨서 요청 자체가 503(Exceeded CPU Limit)으로 죽는 문제가 있었다.
-  //    대신 3시간마다(오전 6~9시는 30분마다) 도는 Cron(runScheduledArchive)이 백그라운드에서
+  //    대신 3시간마다(오전 7~10시는 30분마다) 도는 Cron(runScheduledArchive)이 백그라운드에서
   //    미리 계산해 아카이브에 저장해두고, 여기서는 그 캐시된 값만 이어받는다. 그래서 방금 수집된
   //    기사는 다음 Cron 주기까지 임베딩이 없을 수 있고, 그동안은 단어겹침 신호만으로 클러스터링된다.
   const priorityArticles = allArticles.filter((a) => PRIORITY_FEED_TITLES.includes(a.feedTitle));
@@ -766,14 +766,14 @@ export default {
 
   /** Cloudflare Cron Trigger 진입점 (wrangler.toml의 [triggers] crons 설정에 의해 호출됨) */
   async scheduled(event, env, ctx) {
-    if (event.cron === '0 0 * * *') {
-      // 00:00 UTC = 오전 9시 KST — Today News 확정 시점.
+    if (event.cron === '0 1 * * *') {
+      // 01:00 UTC = 오전 10시 KST — Today News 확정 시점.
       // 마감 직전 마지막 수집을 한 번 더 한 뒤(막판에 나온 기사도 놓치지 않도록), 지정 피드의 표시 상태 리셋.
       ctx.waitUntil(
         runScheduledArchive(env).then(() => resetDailyMarkers(env.DB, PRIORITY_FEED_TITLES))
       );
     } else {
-      // '0 */3 * * *'(3시간마다, 종일) 또는 '*/30 21-23 * * *'(오전 6~9시 KST, 30분마다) 둘 다 수집만.
+      // '0 */3 * * *'(3시간마다, 종일), '*/30 22-23 * * *'·'30 0 * * *'(오전 7~10시 KST, 30분마다) 모두 수집만.
       ctx.waitUntil(runScheduledArchive(env));
     }
   },
