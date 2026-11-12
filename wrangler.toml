@@ -44,7 +44,16 @@ binding = "AI"
 # 설정: wrangler secret put DECODE_PROXY_URL   (예: https://gnews-decode.<도메인>/decode)
 #       wrangler secret put DECODE_PROXY_TOKEN (nas-decode-server의 DECODE_TOKEN과 동일한 값)
 
-# 8. API 인증 - 개인용 단일 사용자 도구라 로그인 화면 없이 공유 비밀키 하나로 모든 엔드포인트를 보호한다.
-#    프론트엔드는 모든 요청에 X-API-Key 헤더로 이 값을 실어 보내야 한다(NEXT_PUBLIC_API_KEY).
-#    설정 안 하면(로컬 개발 등) 인증을 건너뛰므로, 운영 배포에는 반드시 설정할 것.
+# 8. 앱 공유 키(선택) - 사용자 인증은 9번의 Google 로그인 세션이 담당하고, 이 키는 우리 프론트가 아닌 곳에서
+#    Worker를 두드리는 봇을 걸러내는 1차 관문이다. 프론트엔드는 모든 요청에 X-API-Key 헤더로 이 값을 실어
+#    보낸다(NEXT_PUBLIC_API_KEY). 설정 안 하면 이 검사는 건너뛴다.
 # 설정: wrangler secret put API_KEY
+
+# 9. 사용자 로그인 (Google) + 어드민
+#    - GOOGLE_CLIENT_ID: Google Cloud Console → API 및 서비스 → 사용자 인증 정보 → "OAuth 클라이언트 ID"(웹 애플리케이션)로
+#      발급한 클라이언트 ID. 공개돼도 되는 값이라 [vars]에 둔다. 프론트의 NEXT_PUBLIC_GOOGLE_CLIENT_ID와 같은 값이어야 한다.
+#    - ADMIN_EMAILS: 이 이메일(쉼표로 여러 개)로 로그인하면 자동으로 어드민 + 승인 상태가 된다. 기존 단일 사용자 시절
+#      데이터(피드/읽음/스크랩)는 여기 적힌 이메일로 처음 로그인한 계정에 연결된다. 이메일은 개인정보라 secret으로 등록.
+# 설정: wrangler secret put ADMIN_EMAILS
+[vars]
+GOOGLE_CLIENT_ID = ""
