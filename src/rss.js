@@ -47,14 +47,49 @@ async function fetchWithTimeout(url, options, timeoutMs) {
   }
 }
 
-/** 캐시 항목을 읽는다 (신선도와 무관하게 있으면 반환, 형식이 깨졌으면 null) */
+// Cloudflare KV 키는 UTF-8 기준 최대 512바이트. 검색 조건이 긴 구글 뉴스 피드(한글은 글자당 3바이트)는
+// "rss:<주소>"가 이를 넘어 KV가 414로 거부하고, 그 예외 때문에 피드 수집 전체가 실패했다(2026-11-16 보안 피드).
+const KV_KEY_MAX_BYTES = 512;
+const utf8 = new TextEncoder();
+
+/**
+ * 피드 주소별 캐시 키. 512바이트 이내면 예전과 같은 "prefix:주소" 그대로(기존 캐시 계속 사용),
+ * 넘으면 주소의 SHA-256 해시로 대신한다("prefix:sha256:<64자 hex>", 항상 80바이트 미만).
+ */
+export async function rssCacheKey(prefix, rssUrl) {
+  const plain = `${prefix}:${rssUrl}`;
+  if (utf8.encode(plain).length <= KV_KEY_MAX_BYTES) return plain;
+  const digest = await crypto.subtle.digest('SHA-256', utf8.encode(rssUrl));
+  const hex = [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0')).join('');
+  return `${prefix}:sha256:${hex}`;
+}
+
+/**
+ * 캐시 항목을 읽는다 (신선도와 무관하게 있으면 반환, 형식이 깨졌거나 KV 오류면 null).
+ * 캐시는 보조 수단이라 KV 쪽 문제로 피드 수집 자체가 실패하면 안 된다.
+ */
 async function readCacheEntry(kv, cacheKey) {
-  const raw = await kv.get(cacheKey);
+  let raw;
+  try {
+    raw = await kv.get(cacheKey);
+  } catch (err) {
+    console.log('[rss] KV 캐시 읽기 실패(무시하고 계속):', cacheKey.slice(0, 80), err?.message);
+    return null;
+  }
   if (!raw) return null;
   try {
     return JSON.parse(raw);
   } catch {
     return null; // 예전 포맷(순수 XML 문자열) 등 — 캐시 없는 것으로 취급
+  }
+}
+
+/** 캐시 저장. 실패해도(용량/키 문제 등) 방금 받아온 데이터는 그대로 쓰도록 예외를 삼킨다 */
+async function writeCacheEntry(kv, cacheKey, entry) {
+  try {
+    await kv.put(cacheKey, JSON.stringify(entry), { expirationTtl: CACHE_STORAGE_SECONDS });
+  } catch (err) {
+    console.log('[rss] KV 캐시 저장 실패(무시하고 계속):', cacheKey.slice(0, 80), err?.message);
   }
 }
 
@@ -71,7 +106,7 @@ function isFreshEntry(entry) {
  * @returns {Promise<string>} 원본 XML 텍스트
  */
 export async function fetchRssWithCache(rssUrl, kv, force = false) {
-  const cacheKey = `rss:${rssUrl}`;
+  const cacheKey = await rssCacheKey('rss', rssUrl);
 
   if (!force) {
     const cached = await readCacheEntry(kv, cacheKey);
@@ -92,9 +127,7 @@ export async function fetchRssWithCache(rssUrl, kv, force = false) {
 
     if (res.ok) {
       const xmlText = await res.text();
-      await kv.put(cacheKey, JSON.stringify({ xml: xmlText, fetchedAt: Date.now() }), {
-        expirationTtl: CACHE_STORAGE_SECONDS,
-      });
+      await writeCacheEntry(kv, cacheKey, { xml: xmlText, fetchedAt: Date.now() });
       return xmlText;
     }
 
@@ -116,7 +149,7 @@ export async function fetchRssWithCache(rssUrl, kv, force = false) {
  * @param {KVNamespace} kv
  */
 export async function fetchViaRss2Json(rssUrl, apiKey, kv, force = false) {
-  const cacheKey = `rss2json:${rssUrl}`;
+  const cacheKey = await rssCacheKey('rss2json', rssUrl);
 
   if (!force) {
     const cached = await readCacheEntry(kv, cacheKey);
@@ -142,9 +175,7 @@ export async function fetchViaRss2Json(rssUrl, apiKey, kv, force = false) {
     throw new Error(`rss2json returned error: ${data.message || 'unknown'}`);
   }
 
-  await kv.put(cacheKey, JSON.stringify({ items: data.items, fetchedAt: Date.now() }), {
-    expirationTtl: CACHE_STORAGE_SECONDS,
-  });
+  await writeCacheEntry(kv, cacheKey, { items: data.items, fetchedAt: Date.now() });
   return data.items;
 }
 
@@ -186,9 +217,9 @@ export function parseRss2JsonItems(items, feedMeta = {}) {
  * 것보다는 오래된 기사라도 보여주는 게 낫기 때문. 어느 쪽 캐시도 없으면 그제서야 예외를 던진다.
  */
 async function fallbackToStaleCache(env, feed, feedMeta) {
-  const directEntry = await readCacheEntry(env.RSS_CACHE, `rss:${feed.rss_url}`);
+  const directEntry = await readCacheEntry(env.RSS_CACHE, await rssCacheKey('rss', feed.rss_url));
   const rss2jsonEntry = env.RSS2JSON_API_KEY
-    ? await readCacheEntry(env.RSS_CACHE, `rss2json:${feed.rss_url}`)
+    ? await readCacheEntry(env.RSS_CACHE, await rssCacheKey('rss2json', feed.rss_url))
     : null;
 
   const directTime = directEntry?.fetchedAt ?? -1;
@@ -225,11 +256,11 @@ export async function fetchArticlesForFeed(feed, env, force = false) {
   const feedMeta = { id: feed.id, title: feed.title, category: feed.category };
 
   if (!force) {
-    const freshDirect = await readCacheEntry(env.RSS_CACHE, `rss:${feed.rss_url}`);
+    const freshDirect = await readCacheEntry(env.RSS_CACHE, await rssCacheKey('rss', feed.rss_url));
     if (isFreshEntry(freshDirect)) return parseRssItems(freshDirect.xml, feedMeta);
 
     if (env.RSS2JSON_API_KEY) {
-      const freshRss2json = await readCacheEntry(env.RSS_CACHE, `rss2json:${feed.rss_url}`);
+      const freshRss2json = await readCacheEntry(env.RSS_CACHE, await rssCacheKey('rss2json', feed.rss_url));
       if (isFreshEntry(freshRss2json)) return parseRss2JsonItems(freshRss2json.items, feedMeta);
     }
   }
