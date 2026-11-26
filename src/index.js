@@ -5,6 +5,14 @@ import { formatKstDisplay } from './utils/kstDisplay.js';
 import { decodeGoogleNewsUrl } from './utils/googleNewsDecoder.js';
 import { computeEmbeddings } from './utils/embeddings.js';
 import { backfillOriginalLinks, isDailyExportRun, sendDailyExport } from './dailyExport.js';
+
+/**
+ * 매시 정각 Cron (wrangler.toml crons와 같은 문자열이어야 함).
+ * 3의 배수 시(UTC)에는 예전 '0 *\/3 * * *'처럼 전체 수집, 나머지 시각에는 원문 링크 변환만 한다.
+ * (무료 플랜은 계정당 Cron 5개 제한이라 변환 전용 Cron을 따로 둘 수 없어 하나로 합침)
+ */
+const HOURLY_CRON = '0 * * * *';
+const DECODE_ONLY_BUDGET = 45; // 외부 요청 50개 한도 안 (변환 1건 = NAS 릴레이 요청 1개)
 import {
   verifyGoogleIdToken,
   upsertGoogleUser,
@@ -795,8 +803,16 @@ export default {
           .then((r) => console.log('[cron] 시트 내보내기:', JSON.stringify(r).slice(0, 300)))
           .catch((err) => console.log('[cron] 시트 내보내기 실패:', String(err?.message || err)))
       );
+    } else if (event.cron === HOURLY_CRON && new Date(event.scheduledTime).getUTCHours() % 3 !== 0) {
+      // 3의 배수가 아닌 매시 정각 — 수집 없이 원문 링크 변환만 (외부 요청 50개 한도를 변환에 거의 다 씀).
+      // 수집 Cron 안의 변환 몫(피드 수에 따라 20건 안팎)만으로는 하루 수집량(150건+)을 못 따라가서 추가.
+      ctx.waitUntil(
+        backfillOriginalLinks(env, DECODE_ONLY_BUDGET)
+          .then((r) => console.log('[cron] 원문 링크 변환:', JSON.stringify(r)))
+          .catch((err) => console.log('[cron] 원문 링크 변환 실패:', String(err?.message || err)))
+      );
     } else {
-      // '0 */3 * * *'(3시간마다, 종일), '*/30 22-23 * * *'·'30 0 * * *'(오전 7~10시 KST, 30분마다) 모두 수집만.
+      // '0 * * * *' 중 3시간마다(종일), '*/30 22-23 * * *'·'30 0 * * *'(오전 7~10시 KST, 30분마다) 모두 수집만.
       ctx.waitUntil(runScheduledArchive(env));
     }
   },
