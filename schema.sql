@@ -111,9 +111,12 @@ CREATE TABLE IF NOT EXISTS archived_articles (
   pub_date_epoch INTEGER,                  -- migration_008: pub_date를 파싱한 밀리초 타임스탬프 (SQL 필터/정렬용)
   summary TEXT,
   embedding TEXT,                          -- migration_006: bge-m3 임베딩 벡터(JSON 문자열 캐시)
+  original_link TEXT,                      -- migration_010: 구글 뉴스 링크를 변환한 원문 URL (미처리/실패면 NULL)
+  decode_attempts INTEGER NOT NULL DEFAULT 0, -- migration_010: 원문 변환 시도 횟수 (3회 실패 시 포기)
   first_seen_at DATETIME DEFAULT CURRENT_TIMESTAMP,
   last_seen_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE INDEX IF NOT EXISTS idx_archived_feed ON archived_articles(feed_id);
 CREATE INDEX IF NOT EXISTS idx_archived_pub_date_epoch ON archived_articles(pub_date_epoch);
+CREATE INDEX IF NOT EXISTS idx_archived_first_seen ON archived_articles(first_seen_at);

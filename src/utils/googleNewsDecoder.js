@@ -61,6 +61,23 @@ export async function decodeGoogleNewsUrl(googleUrl, env = {}) {
 
 const DECODE_PROXY_URL_KV_KEY = 'system:decode_proxy_url';
 
+/**
+ * 대량 변환용: NAS 릴레이 한 번만 시도하고, 실패하면 null (Worker에서 구글로 직접 요청하는 폴백은
+ * 어차피 차단돼 실패하면서 요청을 여러 번 써버리므로, 하루 수백 건을 처리하는 백그라운드 변환에선 생략).
+ * @returns {Promise<string|null>} 원문 URL 또는 null
+ */
+export async function decodeGoogleNewsUrlViaNasOnly(googleUrl, env = {}) {
+  try {
+    if (!googleUrl || !isGoogleNewsHost(new URL(googleUrl).hostname)) return null;
+    const viaNas = await decodeViaNasProxy(googleUrl, env);
+    if (!viaNas) return null;
+    const normalized = normalizeUrl(viaNas);
+    return isGoogleNewsHost(new URL(normalized).hostname) ? null : normalized;
+  } catch {
+    return null;
+  }
+}
+
 /** 0차 시도: NAS 등 가정용 IP에서 돌아가는 전용 릴레이 서버(nas-decode-server) 경유 */
 async function decodeViaNasProxy(googleUrl, env) {
   try {

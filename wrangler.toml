@@ -57,5 +57,10 @@ binding = "AI"
 #    - ADMIN_EMAILS: 이 이메일(쉼표로 여러 개)로 로그인하면 자동으로 어드민 + 승인 상태가 된다. 기존 단일 사용자 시절
 #      데이터(피드/읽음/스크랩)는 여기 적힌 이메일로 처음 로그인한 계정에 연결된다. 이메일은 개인정보라 secret으로 등록.
 # 설정: wrangler secret put ADMIN_EMAILS
+# 10. 매일 07시(KST) 구글 시트 내보내기 (src/dailyExport.js, Apps Script 코드는 apps-script/JDTimesExport.gs)
+#    - EXPORT_WEBHOOK_URL: Apps Script 웹 앱 배포 주소(…/exec), EXPORT_WEBHOOK_TOKEN: 스크립트의 SHARED_TOKEN과 같은 값
+#    - 둘 다 secret. 설정 안 하면 내보내기만 건너뛴다(수집·원문 링크 변환은 그대로 동작).
+#    - EXPORT_USER_ID(선택, vars): 이 사용자가 구독한 피드 기사만 내보냄. 기본 1(기존 소유자/어드민)
+# 설정: wrangler secret put EXPORT_WEBHOOK_URL / wrangler secret put EXPORT_WEBHOOK_TOKEN
 [vars]
 GOOGLE_CLIENT_ID = "1022918442836-bkndh5gbt4kcoedrfodgvlp41hlh8foe.apps.googleusercontent.com"

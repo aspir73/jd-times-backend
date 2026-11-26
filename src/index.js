@@ -4,6 +4,7 @@ import { hashArticleId } from './utils/hash.js';
 import { formatKstDisplay } from './utils/kstDisplay.js';
 import { decodeGoogleNewsUrl } from './utils/googleNewsDecoder.js';
 import { computeEmbeddings } from './utils/embeddings.js';
+import { backfillOriginalLinks, isDailyExportRun, sendDailyExport } from './dailyExport.js';
 import {
   verifyGoogleIdToken,
   upsertGoogleUser,
@@ -577,6 +578,10 @@ async function handleAdminAssignFeed(request, env, feedId) {
 async function routeAdmin(request, env, admin, pathname) {
   const method = request.method;
 
+  // 07시 시트 내보내기를 지금 바로 한 번 실행 (Apps Script 연결 확인용) — 지난 24시간 수집분
+  if (pathname === '/api/admin/export-sheet' && method === 'POST') {
+    return json(await sendDailyExport(env));
+  }
   if (pathname === '/api/admin/stats' && method === 'GET') {
     return json(await getAdminStats(env.DB));
   }
@@ -669,6 +674,16 @@ async function runScheduledArchive(env) {
 
   await upsertArchivedArticles(env.DB, withIds);
   await recordFeedFetchResults(env.DB, fetchResults);
+
+  // 새 기사 링크를 원문 주소로 조금씩 변환 (07시 시트 내보내기·CEO 기사 선정에서 원문을 직접 읽기 위함).
+  // 무료 플랜은 실행당 외부 요청 50개 제한 — 피드 수집(재시도 포함 피드당 최대 2회)에 쓰고 남은 만큼만 쓴다.
+  const decodeBudget = Math.max(0, 40 - feeds.length * 2);
+  try {
+    const r = await backfillOriginalLinks(env, decodeBudget);
+    if (r.tried) console.log('[cron] 원문 링크 변환:', r.decoded, '/', r.tried);
+  } catch (err) {
+    console.log('[cron] 원문 링크 변환 실패(무시):', String(err?.message || err));
+  }
 }
 
 // ============================================================
@@ -771,6 +786,14 @@ export default {
       // 마감 직전 마지막 수집을 한 번 더 한 뒤(막판에 나온 기사도 놓치지 않도록), 지정 피드의 표시 상태 리셋.
       ctx.waitUntil(
         runScheduledArchive(env).then(() => resetDailyMarkers(env.DB, PRIORITY_FEED_TITLES))
+      );
+    } else if (isDailyExportRun(event)) {
+      // 22:00 UTC = 오전 7시 KST — 수집(+원문 링크 변환) 후 지난 24시간 수집분을 구글 시트로 내보낸다.
+      ctx.waitUntil(
+        runScheduledArchive(env)
+          .then(() => sendDailyExport(env, { endMs: event.scheduledTime }))
+          .then((r) => console.log('[cron] 시트 내보내기:', JSON.stringify(r).slice(0, 300)))
+          .catch((err) => console.log('[cron] 시트 내보내기 실패:', String(err?.message || err)))
       );
     } else {
       // '0 */3 * * *'(3시간마다, 종일), '*/30 22-23 * * *'·'30 0 * * *'(오전 7~10시 KST, 30분마다) 모두 수집만.
