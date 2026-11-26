@@ -83,12 +83,16 @@ test('backfill decodes pending links, counts attempts, gives up after 3 failures
   globalThis.fetch = async (url) => {
     const target = new URL(url).searchParams.get('url');
     if (target.includes('CBMi3')) return new Response('fail', { status: 502 });
+    // 릴레이가 기사 대신 아이콘 이미지 주소를 주는 경우 → 실패로 처리돼야 함
+    if (target.includes('CBMi5')) return Response.json({ url: 'https://lh3.googleusercontent.com/-DR60l=w16' });
     return Response.json({ url: `https://news.example.com/${target.match(/CBMi(\d+)/)[1]}?utm_source=x` });
   };
   const env = { DB: db, RSS_CACHE: { get: async () => 'https://relay.example/decode' }, DECODE_PROXY_TOKEN: 't' };
   try {
     const first = await backfillOriginalLinks(env, 10);
-    assert.deepEqual(first, { tried: 5, decoded: 4 });
+    assert.deepEqual(first, { tried: 5, decoded: 3 });
+    const icon = db.sqlite.prepare(`SELECT original_link FROM archived_articles WHERE article_id='b-other'`).get();
+    assert.equal(icon.original_link, null);
     const row = db.sqlite.prepare(`SELECT original_link, decode_attempts FROM archived_articles WHERE article_id='a-in1'`).get();
     assert.equal(row.original_link, 'https://news.example.com/2'); // 추적 파라미터 제거
     await backfillOriginalLinks(env, 10);

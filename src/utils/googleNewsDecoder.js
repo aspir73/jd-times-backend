@@ -72,10 +72,18 @@ export async function decodeGoogleNewsUrlViaNasOnly(googleUrl, env = {}) {
     const viaNas = await decodeViaNasProxy(googleUrl, env);
     if (!viaNas) return null;
     const normalized = normalizeUrl(viaNas);
-    return isGoogleNewsHost(new URL(normalized).hostname) ? null : normalized;
+    const host = new URL(normalized).hostname;
+    // 릴레이가 가끔 기사 대신 언론사 아이콘 이미지 주소(lh3.googleusercontent.com/...=w16)를 돌려준다 → 실패로 처리
+    if (isGoogleNewsHost(host) || isGoogleAssetHost(host)) return null;
+    return normalized;
   } catch {
     return null;
   }
+}
+
+/** 기사 원문일 수 없는 구글 이미지/정적 파일 호스트 */
+function isGoogleAssetHost(hostname) {
+  return /(^|\.)(googleusercontent\.com|gstatic\.com|ggpht\.com)$/.test(hostname);
 }
 
 /** 0차 시도: NAS 등 가정용 IP에서 돌아가는 전용 릴레이 서버(nas-decode-server) 경유 */
